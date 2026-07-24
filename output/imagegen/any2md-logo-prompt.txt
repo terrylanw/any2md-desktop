@@ -1,0 +1,8 @@
+Use case: logo-brand
+Asset type: production desktop application icon for Any2MD, a local office-document-to-Markdown converter
+Primary request: Create a distinctive minimal geometric emblem where an ivory document sheet with one warm-gold folded corner transforms downward into a bold abstract conversion arrow. The arrow negative space should subtly evoke the shape of an M without using literal typography.
+Style/medium: precise flat vector-like graphic, clean Swiss-modern software identity, strong silhouette, crisp edges
+Composition/framing: centered and balanced, large simple forms, generous internal spacing, readable at 16 pixels; place the emblem inside a deep emerald rounded-square tile occupying about 88 percent of the canvas
+Color palette: deep emerald #087F68, near-black green #12312B, warm ivory #F7F5EE, restrained amber-gold #9B6B00
+Constraints: outside the rounded tile use one perfectly flat solid chroma-key magenta #FF00FF; keep that magenta completely absent from the icon; no shadows, no gradients, no lighting variation, no texture, no floor plane; no text, no letters, no words, no border, no watermark, no mockup, no extra objects
+Output intent: scalable Windows and macOS app icon and compact in-app brand mark

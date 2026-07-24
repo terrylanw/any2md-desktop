@@ -1,0 +1,7 @@
+Use case: logo-brand
+Asset type: production desktop application icon refinement
+Input images: Image 1 is the edit target and its emblem composition must be preserved
+Primary request: Change only the rendering style of Image 1 into a strictly flat two-dimensional vector pictogram. Preserve the centered rounded-square tile, the document silhouette, the single folded corner, the M-shaped negative space, the large downward arrow, the proportions, spacing, and overall silhouette.
+Color palette: outside chroma-key background exactly uniform #FF00FF; rounded-square tile exactly uniform deep emerald #087F68; arrow exactly uniform near-black green #12312B; document exactly uniform warm ivory #F7F5EE; folded corner exactly uniform amber-gold #9B6B00
+Constraints: use only these five solid colors with clean antialiased edges; remove every gradient, highlight, glow, reflection, shadow, bevel, texture, blur, depth effect, inner line, and white outline around the arrow; no lighting variation; keep magenta absent from the icon tile; no text, no letters, no words, no border, no watermark, no mockup, no extra objects
+Output intent: crisp scalable Windows and macOS app icon that remains legible at 16 pixels
