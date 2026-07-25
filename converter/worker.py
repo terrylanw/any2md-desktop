@@ -59,7 +59,7 @@ def handle_request(message: Any, converter: Converter) -> tuple[dict[str, Any], 
             "ok": True,
             "data": {},
         }, True
-    if method != "convert":
+    if method not in {"convert", "inspect_workbook"}:
         return error_payload(
             request_id,
             ConversionError("protocol_error", f"unknown method: {method}"),
@@ -84,8 +84,44 @@ def handle_request(message: Any, converter: Converter) -> tuple[dict[str, Any], 
             ConversionError("protocol_error", "inputType must be a string"),
         ), False
 
+    if method == "inspect_workbook":
+        try:
+            inspection = converter.inspect_workbook(input_path, input_type)
+        except ConversionError as error:
+            return error_payload(request_id, error), False
+        return {
+            "v": PROTOCOL_VERSION,
+            "id": request_id,
+            "type": "result",
+            "ok": True,
+            "data": {
+                "sheets": [
+                    {
+                        "name": sheet.name,
+                        "index": sheet.index,
+                        "visibility": sheet.visibility,
+                        "isEmpty": sheet.is_empty,
+                        "rowCount": sheet.row_count,
+                        "columnCount": sheet.column_count,
+                        "preview": sheet.preview,
+                    }
+                    for sheet in inspection.sheets
+                ]
+            },
+        }, False
+
+    sheet_names = params.get("sheetNames")
+    if sheet_names is not None and (
+        not isinstance(sheet_names, list)
+        or any(not isinstance(name, str) or not name for name in sheet_names)
+    ):
+        return error_payload(
+            request_id,
+            ConversionError("protocol_error", "sheetNames must be a string array"),
+        ), False
+
     try:
-        result = converter.convert(input_path, input_type)
+        result = converter.convert(input_path, input_type, sheet_names)
     except ConversionError as error:
         return error_payload(request_id, error), False
 
@@ -122,7 +158,12 @@ def run(input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) ->
         {
             "v": PROTOCOL_VERSION,
             "type": "ready",
-            "capabilities": ["convert", "result_file"],
+            "capabilities": [
+                "convert",
+                "result_file",
+                "inspect_workbook",
+                "xlsx_sheet_selection",
+            ],
         },
         output_stream,
     )

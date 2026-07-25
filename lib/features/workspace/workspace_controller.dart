@@ -84,6 +84,13 @@ class WorkspaceController extends Notifier<WorkspaceState> {
         themePreference: theme,
         initialized: true,
       );
+      if (drafts.any(
+        (task) =>
+            task.status == ConversionStatus.inspectionQueued ||
+            task.status == ConversionStatus.queued,
+      )) {
+        unawaited(_drainQueue());
+      }
     } on Object {
       state = state.copyWith(initialized: true);
     } finally {
@@ -138,7 +145,9 @@ class WorkspaceController extends Notifier<WorkspaceState> {
             sourcePath: absolutePath,
             displayName: path.basename(absolutePath),
             inputType: inputType,
-            status: ConversionStatus.queued,
+            status: inputType == 'xlsx'
+                ? ConversionStatus.inspectionQueued
+                : ConversionStatus.queued,
             createdAt: DateTime.now(),
           ),
         );
@@ -149,6 +158,11 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       state = state.copyWith(
         tasks: [...state.tasks, ...added],
         selectedTaskId: added.first.id,
+      );
+      await Future.wait(
+        added
+            .where((task) => task.inputType == 'xlsx')
+            .map((task) => ref.read(draftStoreProvider).save(task)),
       );
       unawaited(_drainQueue());
     } else if (duplicates > 0 && paths.length == 1) {
@@ -178,7 +192,13 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     if (task == null) return;
     _pendingMarkdown[taskId] = markdown;
     if (!task.isDirty) {
-      _replaceTask(task.copyWith(isDirty: true, clearExportedPath: true));
+      _replaceTask(
+        task.copyWith(
+          isDirty: true,
+          hasManualEdits: true,
+          clearExportedPath: true,
+        ),
+      );
     }
     _draftTimers.remove(taskId)?.cancel();
     _draftTimers[taskId] = Timer(const Duration(milliseconds: 120), () {
@@ -241,13 +261,75 @@ class WorkspaceController extends Notifier<WorkspaceState> {
   Future<void> retryTask(String id) async {
     final task = _taskById(id);
     if (task == null || task.status == ConversionStatus.converting) return;
-    _replaceTask(
-      task.copyWith(
-        status: ConversionStatus.queued,
-        clearError: true,
-        warnings: const [],
-      ),
+    final needsInspection =
+        task.inputType == 'xlsx' &&
+        (task.workbookSheets.isEmpty ||
+            task.errorCode == 'sheet_selection_invalid');
+    final nextStatus = needsInspection
+        ? ConversionStatus.inspectionQueued
+        : task.inputType == 'xlsx' && task.selectedSheetNames.isEmpty
+        ? ConversionStatus.awaitingSheetSelection
+        : ConversionStatus.queued;
+    final updated = task.copyWith(
+      status: nextStatus,
+      clearError: true,
+      warnings: const [],
     );
+    _replaceTask(updated);
+    await ref.read(draftStoreProvider).save(updated);
+    unawaited(_drainQueue());
+  }
+
+  Future<void> updateSheetSelection(
+    String id,
+    Iterable<String> sheetNames,
+  ) async {
+    final task = _taskById(id);
+    if (task == null ||
+        task.inputType != 'xlsx' ||
+        task.status != ConversionStatus.awaitingSheetSelection) {
+      return;
+    }
+    final selectable = {
+      for (final sheet in task.workbookSheets)
+        if (sheet.isSelectable) sheet.name,
+    };
+    final requested = sheetNames.toSet();
+    final ordered = [
+      for (final sheet in task.workbookSheets)
+        if (requested.contains(sheet.name) && selectable.contains(sheet.name))
+          sheet.name,
+    ];
+    final updated = task.copyWith(
+      selectedSheetNames: ordered,
+      revision: task.revision + 1,
+    );
+    _replaceTask(updated);
+    await ref.read(draftStoreProvider).save(updated);
+  }
+
+  Future<void> confirmSheetSelection(
+    String id,
+    Iterable<String> sheetNames,
+  ) async {
+    await flushMarkdown(id);
+    final task = _taskById(id);
+    if (task == null || task.inputType != 'xlsx') return;
+    final requested = sheetNames.toSet();
+    final ordered = [
+      for (final sheet in task.workbookSheets)
+        if (sheet.isSelectable && requested.contains(sheet.name)) sheet.name,
+    ];
+    if (ordered.isEmpty) return;
+    final updated = task.copyWith(
+      status: ConversionStatus.queued,
+      selectedSheetNames: ordered,
+      clearError: true,
+      clearExportedPath: true,
+      revision: task.revision + 1,
+    );
+    _replaceTask(updated);
+    await ref.read(draftStoreProvider).save(updated);
     unawaited(_drainQueue());
   }
 
@@ -255,11 +337,18 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     final task = _taskById(id);
     if (task == null) return;
     await flushMarkdown(id);
-    if (task.status == ConversionStatus.queued) {
-      _replaceTask(task.copyWith(status: ConversionStatus.cancelled));
+    if (task.status == ConversionStatus.queued ||
+        task.status == ConversionStatus.inspectionQueued ||
+        task.status == ConversionStatus.awaitingSheetSelection) {
+      final cancelled = task.copyWith(status: ConversionStatus.cancelled);
+      _replaceTask(cancelled);
+      await ref.read(draftStoreProvider).save(cancelled);
       return;
     }
-    if (task.status != ConversionStatus.converting) return;
+    if (task.status != ConversionStatus.converting &&
+        task.status != ConversionStatus.inspecting) {
+      return;
+    }
     _cancelledTaskIds.add(id);
     await ref.read(converterClientProvider).cancelCurrent();
   }
@@ -267,7 +356,8 @@ class WorkspaceController extends Notifier<WorkspaceState> {
   Future<void> removeTask(String id) async {
     final task = _taskById(id);
     if (task == null) return;
-    if (task.status == ConversionStatus.converting) {
+    if (task.status == ConversionStatus.converting ||
+        task.status == ConversionStatus.inspecting) {
       _cancelledTaskIds.add(id);
       await ref.read(converterClientProvider).cancelCurrent();
     }
@@ -309,15 +399,27 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     try {
       while (true) {
         final queued = state.tasks.where(
-          (task) => task.status == ConversionStatus.queued,
+          (task) =>
+              task.status == ConversionStatus.inspectionQueued ||
+              task.status == ConversionStatus.queued,
         );
         if (queued.isEmpty) break;
         final task = queued.first;
+        if (task.status == ConversionStatus.inspectionQueued) {
+          await _inspectTask(task);
+          continue;
+        }
         _replaceTask(task.copyWith(status: ConversionStatus.converting));
         try {
           final output = await ref
               .read(converterClientProvider)
-              .convert(inputPath: task.sourcePath, inputType: task.inputType);
+              .convert(
+                inputPath: task.sourcePath,
+                inputType: task.inputType,
+                sheetNames: task.inputType == 'xlsx'
+                    ? task.selectedSheetNames
+                    : null,
+              );
           final current = _taskById(task.id);
           if (current == null) continue;
           final ready = current.copyWith(
@@ -325,6 +427,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
             markdown: output.markdown,
             warnings: output.warnings,
             isDirty: true,
+            hasManualEdits: false,
             clearError: true,
             revision: current.revision + 1,
           );
@@ -335,8 +438,18 @@ class WorkspaceController extends Notifier<WorkspaceState> {
           if (current == null) continue;
           final wasCancelled =
               error.code == 'cancelled' || _cancelledTaskIds.remove(task.id);
-          _replaceTask(
-            current.copyWith(
+          if (!wasCancelled && error.code == 'sheet_selection_invalid') {
+            final stale = current.copyWith(
+              status: ConversionStatus.inspectionQueued,
+              clearWorkbookSheets: true,
+              errorCode: error.code,
+              errorMessage: error.message,
+              errorRetryable: false,
+            );
+            _replaceTask(stale);
+            await ref.read(draftStoreProvider).save(stale);
+          } else {
+            final failed = current.copyWith(
               status: wasCancelled
                   ? ConversionStatus.cancelled
                   : ConversionStatus.failed,
@@ -344,26 +457,98 @@ class WorkspaceController extends Notifier<WorkspaceState> {
               errorMessage: wasCancelled ? null : error.message,
               errorRetryable: !wasCancelled && error.retryable,
               clearError: wasCancelled,
-            ),
-          );
+            );
+            _replaceTask(failed);
+            await ref.read(draftStoreProvider).save(failed);
+          }
         } on Object catch (error) {
           final current = _taskById(task.id);
           if (current == null) continue;
-          _replaceTask(
-            current.copyWith(
-              status: ConversionStatus.failed,
-              errorCode: 'worker_crashed',
-              errorMessage: error.toString(),
-              errorRetryable: true,
-            ),
+          final failed = current.copyWith(
+            status: ConversionStatus.failed,
+            errorCode: 'worker_crashed',
+            errorMessage: error.toString(),
+            errorRetryable: true,
           );
+          _replaceTask(failed);
+          await ref.read(draftStoreProvider).save(failed);
         }
       }
     } finally {
       _processing = false;
-      if (state.tasks.any((task) => task.status == ConversionStatus.queued)) {
+      if (state.tasks.any(
+        (task) =>
+            task.status == ConversionStatus.inspectionQueued ||
+            task.status == ConversionStatus.queued,
+      )) {
         unawaited(_drainQueue());
       }
+    }
+  }
+
+  Future<void> _inspectTask(ConversionTask task) async {
+    _replaceTask(task.copyWith(status: ConversionStatus.inspecting));
+    try {
+      final output = await ref
+          .read(converterClientProvider)
+          .inspectWorkbook(inputPath: task.sourcePath);
+      final current = _taskById(task.id);
+      if (current == null) return;
+      final previousSelection = current.selectedSheetNames.toSet();
+      final defaultSelection = [
+        for (final sheet in output.sheets)
+          if (sheet.isVisible && sheet.isSelectable) sheet.name,
+      ];
+      final retainedSelection = [
+        for (final sheet in output.sheets)
+          if (sheet.isSelectable && previousSelection.contains(sheet.name))
+            sheet.name,
+      ];
+      final selection = previousSelection.isEmpty
+          ? defaultSelection
+          : retainedSelection;
+      final autoConvert =
+          previousSelection.isEmpty && defaultSelection.length == 1;
+      final inspected = current.copyWith(
+        status: autoConvert
+            ? ConversionStatus.queued
+            : ConversionStatus.awaitingSheetSelection,
+        workbookSheets: output.sheets,
+        selectedSheetNames: selection,
+        workbookInspectionVersion:
+            ConversionTask.currentWorkbookInspectionVersion,
+        clearError: true,
+        revision: current.revision + 1,
+      );
+      _replaceTask(inspected);
+      await ref.read(draftStoreProvider).save(inspected);
+    } on ConverterException catch (error) {
+      final current = _taskById(task.id);
+      if (current == null) return;
+      final wasCancelled =
+          error.code == 'cancelled' || _cancelledTaskIds.remove(task.id);
+      final failed = current.copyWith(
+        status: wasCancelled
+            ? ConversionStatus.cancelled
+            : ConversionStatus.failed,
+        errorCode: wasCancelled ? null : error.code,
+        errorMessage: wasCancelled ? null : error.message,
+        errorRetryable: !wasCancelled && error.retryable,
+        clearError: wasCancelled,
+      );
+      _replaceTask(failed);
+      await ref.read(draftStoreProvider).save(failed);
+    } on Object catch (error) {
+      final current = _taskById(task.id);
+      if (current == null) return;
+      final failed = current.copyWith(
+        status: ConversionStatus.failed,
+        errorCode: 'worker_crashed',
+        errorMessage: error.toString(),
+        errorRetryable: true,
+      );
+      _replaceTask(failed);
+      await ref.read(draftStoreProvider).save(failed);
     }
   }
 

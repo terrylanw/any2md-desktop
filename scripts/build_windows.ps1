@@ -6,6 +6,21 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+function Get-AppVersion {
+    param([string]$PubspecPath)
+
+    $pubspec = Get-Content -LiteralPath $PubspecPath -Raw
+    $versionMatch = [regex]::Match(
+        $pubspec,
+        '(?m)^\s*version\s*:\s*[''"]?(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?[''"]?\s*(?:#.*)?$'
+    )
+    if (-not $versionMatch.Success) {
+        throw "Unable to read a valid version from $PubspecPath"
+    }
+
+    return $versionMatch.Groups['version'].Value
+}
+
 function Find-InnoCompiler {
     param([string]$Override)
 
@@ -50,6 +65,9 @@ function Find-InnoCompiler {
     return $null
 }
 
+$appVersion = Get-AppVersion -PubspecPath (Join-Path $repoRoot 'pubspec.yaml')
+Write-Host "Building Any2MD version $appVersion"
+
 & (Join-Path $PSScriptRoot 'build_converter.ps1')
 if (-not $?) {
     throw 'Converter build failed.'
@@ -83,7 +101,8 @@ Copy-Item -LiteralPath $converterSource -Destination $converterDestination -Recu
 $resolvedInnoCompiler = Find-InnoCompiler -Override $InnoCompiler
 if ($resolvedInnoCompiler) {
     Write-Host "Using Inno Setup compiler: $resolvedInnoCompiler"
-    & $resolvedInnoCompiler (Join-Path $repoRoot 'installer\any2md.iss')
+    $versionDefine = "/DMyAppVersion=$appVersion"
+    & $resolvedInnoCompiler $versionDefine (Join-Path $repoRoot 'installer\any2md.iss')
     if ($LASTEXITCODE -ne 0) {
         throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
     }

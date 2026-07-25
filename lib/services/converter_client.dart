@@ -5,11 +5,19 @@ import 'dart:io';
 import 'package:path/path.dart' as path;
 import 'package:uuid/uuid.dart';
 
+import '../domain/conversion_task.dart';
+
 class ConversionOutput {
   const ConversionOutput({required this.markdown, required this.warnings});
 
   final String markdown;
   final List<String> warnings;
+}
+
+class WorkbookInspectionOutput {
+  const WorkbookInspectionOutput({required this.sheets});
+
+  final List<WorkbookSheetInfo> sheets;
 }
 
 class ConverterException implements Exception {
@@ -55,7 +63,7 @@ class ConverterClient {
   StreamSubscription<String>? _stdoutSubscription;
   StreamSubscription<String>? _stderrSubscription;
   Completer<void>? _readyCompleter;
-  Completer<ConversionOutput>? _activeCompleter;
+  Completer<Map<String, Object?>>? _activeCompleter;
   String? _activeRequestId;
   int _generation = 0;
   bool _disposed = false;
@@ -63,6 +71,55 @@ class ConverterClient {
   Future<ConversionOutput> convert({
     required String inputPath,
     required String inputType,
+    List<String>? sheetNames,
+  }) async {
+    final data = await _request(
+      method: 'convert',
+      params: {
+        'inputPath': inputPath,
+        'inputType': inputType,
+        'preferFileResult': true,
+        'sheetNames': ?sheetNames,
+      },
+      timeout: conversionTimeout,
+      timeoutMessage: '转换超过 5 分钟，已终止任务',
+    );
+    final warnings = (data['warnings'] as List<Object?>? ?? const [])
+        .whereType<String>()
+        .toList(growable: false);
+    final markdownPath = data['markdownPath'] as String?;
+    if (markdownPath != null) {
+      return _readFileResult(markdownPath, warnings);
+    }
+    return ConversionOutput(
+      markdown: data['markdown'] as String? ?? '',
+      warnings: warnings,
+    );
+  }
+
+  Future<WorkbookInspectionOutput> inspectWorkbook({
+    required String inputPath,
+  }) async {
+    final data = await _request(
+      method: 'inspect_workbook',
+      params: {'inputPath': inputPath, 'inputType': 'xlsx'},
+      timeout: const Duration(minutes: 1),
+      timeoutMessage: '读取工作簿超过 1 分钟，已终止任务',
+    );
+    final sheets = (data['sheets'] as List<Object?>? ?? const [])
+        .whereType<Map>()
+        .map(
+          (sheet) => WorkbookSheetInfo.fromJson(sheet.cast<String, Object?>()),
+        )
+        .toList(growable: false);
+    return WorkbookInspectionOutput(sheets: sheets);
+  }
+
+  Future<Map<String, Object?>> _request({
+    required String method,
+    required Map<String, Object?> params,
+    required Duration timeout,
+    required String timeoutMessage,
   }) async {
     if (_disposed) {
       throw const ConverterException('worker_crashed', '转换服务已关闭');
@@ -73,32 +130,24 @@ class ConverterClient {
 
     await _ensureStarted();
     final requestId = _uuid.v4();
-    final completer = Completer<ConversionOutput>();
+    final completer = Completer<Map<String, Object?>>();
     _activeRequestId = requestId;
     _activeCompleter = completer;
     _process!.stdin.writeln(
       jsonEncode({
         'v': _protocolVersion,
         'id': requestId,
-        'method': 'convert',
-        'params': {
-          'inputPath': inputPath,
-          'inputType': inputType,
-          'preferFileResult': true,
-        },
+        'method': method,
+        'params': params,
       }),
     );
     await _process!.stdin.flush();
 
     try {
-      return await completer.future.timeout(conversionTimeout);
+      return await completer.future.timeout(timeout);
     } on TimeoutException {
       await restart();
-      throw const ConverterException(
-        'timeout',
-        '转换超过 5 分钟，已终止任务',
-        retryable: true,
-      );
+      throw ConverterException('timeout', timeoutMessage, retryable: true);
     } finally {
       if (identical(_activeCompleter, completer)) {
         _activeCompleter = null;
@@ -187,22 +236,7 @@ class ConverterClient {
     if (completer == null || completer.isCompleted) return;
     if (message['ok'] == true) {
       final data = (message['data'] as Map).cast<String, Object?>();
-      final warnings = (data['warnings'] as List<Object?>? ?? const [])
-          .whereType<String>()
-          .toList(growable: false);
-      final markdownPath = data['markdownPath'] as String?;
-      if (markdownPath != null) {
-        unawaited(
-          _completeFileResult(markdownPath, warnings, completer, generation),
-        );
-      } else {
-        completer.complete(
-          ConversionOutput(
-            markdown: data['markdown'] as String? ?? '',
-            warnings: warnings,
-          ),
-        );
-      }
+      completer.complete(data);
     } else {
       final error = (message['error'] as Map).cast<String, Object?>();
       completer.completeError(
@@ -215,30 +249,20 @@ class ConverterClient {
     }
   }
 
-  Future<void> _completeFileResult(
+  Future<ConversionOutput> _readFileResult(
     String markdownPath,
     List<String> warnings,
-    Completer<ConversionOutput> completer,
-    int generation,
   ) async {
     final file = File(markdownPath);
     try {
       final markdown = await file.readAsString();
-      if (generation == _generation && !completer.isCompleted) {
-        completer.complete(
-          ConversionOutput(markdown: markdown, warnings: warnings),
-        );
-      }
+      return ConversionOutput(markdown: markdown, warnings: warnings);
     } on Object catch (error) {
-      if (!completer.isCompleted) {
-        completer.completeError(
-          ConverterException(
-            'protocol_error',
-            '无法读取转换结果：$error',
-            retryable: true,
-          ),
-        );
-      }
+      throw ConverterException(
+        'protocol_error',
+        '无法读取转换结果：$error',
+        retryable: true,
+      );
     } finally {
       try {
         if (await file.exists()) await file.delete();

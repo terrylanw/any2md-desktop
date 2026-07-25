@@ -10,18 +10,34 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:multi_split_view/multi_split_view.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class TestWorkspaceController extends WorkspaceController {
   TestWorkspaceController(this.initialState);
 
   final WorkspaceState initialState;
+  Set<String>? confirmedSheetNames;
 
   @override
   WorkspaceState build() => initialState;
 
   @override
   Future<void> initialize() async {}
+
+  @override
+  Future<void> updateSheetSelection(
+    String id,
+    Iterable<String> sheetNames,
+  ) async {}
+
+  @override
+  Future<void> confirmSheetSelection(
+    String id,
+    Iterable<String> sheetNames,
+  ) async {
+    confirmedSheetNames = sheetNames.toSet();
+  }
 }
 
 class CountingMarkdownPreviewParser extends MarkdownPreviewParser {
@@ -38,11 +54,15 @@ class CountingMarkdownPreviewParser extends MarkdownPreviewParser {
   }
 }
 
-Widget testApp(WorkspaceState state, {MarkdownPreviewParser? previewParser}) {
+Widget testApp(
+  WorkspaceState state, {
+  MarkdownPreviewParser? previewParser,
+  TestWorkspaceController? controller,
+}) {
   return ProviderScope(
     overrides: [
       workspaceControllerProvider.overrideWith(
-        () => TestWorkspaceController(state),
+        () => controller ?? TestWorkspaceController(state),
       ),
       desktopWindowEnabledProvider.overrideWithValue(false),
       if (previewParser != null)
@@ -91,6 +111,351 @@ void main() {
     expect(find.text('编辑'), findsOneWidget);
     expect(find.text('预览'), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
+  });
+
+  testWidgets('allows the task sidebar to shrink to 180 pixels', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({'sidebar_width': 120.0});
+    final task = ConversionTask(
+      id: 'narrow-sidebar',
+      sourcePath: r'C:\docs\a-very-long-document-name.docx',
+      displayName: 'a-very-long-document-name.docx',
+      inputType: 'docx',
+      status: ConversionStatus.ready,
+      createdAt: DateTime(2026, 7, 24),
+      markdown: '# Report',
+    );
+
+    await tester.pumpWidget(
+      testApp(
+        WorkspaceState(
+          tasks: [task],
+          selectedTaskId: task.id,
+          initialized: true,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final splitView = tester.widget<MultiSplitView>(
+      find.byType(MultiSplitView),
+    );
+    expect(splitView.controller!.areas.first.min, 180);
+    expect(splitView.controller!.areas.first.size, 180);
+    expect(find.byTooltip('移除任务'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('selects and previews workbook sheets', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = ConversionTask(
+      id: 'xlsx-1',
+      sourcePath: r'C:\docs\report.xlsx',
+      displayName: 'report.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime(2026, 7, 24),
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Summary',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 2,
+          columnCount: 2,
+          preview: [
+            ['Name', 'Value'],
+            ['Alpha', '42'],
+          ],
+        ),
+        WorkbookSheetInfo(
+          name: 'Archive',
+          index: 1,
+          visibility: SheetVisibility.hidden,
+          isEmpty: false,
+          rowCount: 8,
+          columnCount: 3,
+          preview: [
+            ['Old'],
+          ],
+        ),
+        WorkbookSheetInfo(
+          name: 'Empty',
+          index: 2,
+          visibility: SheetVisibility.visible,
+          isEmpty: true,
+          rowCount: 0,
+          columnCount: 0,
+          preview: [],
+        ),
+      ],
+      selectedSheetNames: const ['Summary'],
+    );
+    await tester.pumpWidget(
+      testApp(
+        WorkspaceState(
+          tasks: [task],
+          selectedTaskId: task.id,
+          initialized: true,
+        ),
+      ),
+    );
+
+    expect(find.text('3 个工作表 · 已选 1'), findsOneWidget);
+    expect(find.text('转换所选 (1)'), findsOneWidget);
+    expect(find.text('Summary'), findsWidgets);
+    expect(find.text('Alpha'), findsOneWidget);
+    expect(find.text('Archive'), findsNothing);
+    expect(find.text('空工作表'), findsOneWidget);
+
+    await tester.tap(find.byType(Switch));
+    await tester.pump();
+    expect(find.text('Archive'), findsOneWidget);
+
+    await tester.tap(find.byType(Checkbox).first);
+    await tester.pump();
+    expect(find.text('转换所选 (0)'), findsOneWidget);
+    final convertButton = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, '转换所选 (0)'),
+    );
+    expect(convertButton.onPressed, isNull);
+  });
+
+  testWidgets('warns before replacing manually edited workbook markdown', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = ConversionTask(
+      id: 'xlsx-1',
+      sourcePath: r'C:\docs\report.xlsx',
+      displayName: 'report.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.ready,
+      createdAt: DateTime(2026, 7, 24),
+      markdown: '# Edited',
+      isDirty: true,
+      hasManualEdits: true,
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Summary',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 2,
+          columnCount: 2,
+          preview: [
+            ['Name', 'Value'],
+          ],
+        ),
+      ],
+      selectedSheetNames: const ['Summary'],
+    );
+    final controller = TestWorkspaceController(
+      WorkspaceState(tasks: [task], selectedTaskId: task.id, initialized: true),
+    );
+    await tester.pumpWidget(
+      testApp(controller.initialState, controller: controller),
+    );
+
+    await tester.tap(find.text('1 个工作表'));
+    await tester.pump();
+    await tester.tap(find.text('转换所选 (1)'));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('重新转换工作表？'), findsOneWidget);
+    expect(find.textContaining('手动编辑'), findsOneWidget);
+    expect(controller.confirmedSheetNames, isNull);
+  });
+
+  testWidgets('keeps the workbook selector compact in a narrow window', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = ConversionTask(
+      id: 'xlsx-narrow',
+      sourcePath: r'C:\docs\narrow.xlsx',
+      displayName: 'narrow.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime(2026, 7, 24),
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Summary',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 1,
+          columnCount: 1,
+          preview: [
+            ['Value'],
+          ],
+        ),
+      ],
+      selectedSheetNames: const ['Summary'],
+    );
+
+    await tester.pumpWidget(
+      testApp(
+        WorkspaceState(
+          tasks: [task],
+          selectedTaskId: task.id,
+          initialized: true,
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.byType(Switch), findsNothing);
+    expect(find.byTooltip('显示隐藏工作表'), findsOneWidget);
+    expect(find.text('转换所选 (1)'), findsOneWidget);
+    expect(find.text('Value'), findsOneWidget);
+  });
+
+  testWidgets('expands preview rows to show complete cell contents', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    const longValue =
+        'This workbook cell contains a long translation that must remain '
+        'fully visible instead of being clipped after the second line.';
+    final task = ConversionTask(
+      id: 'xlsx-long-cell',
+      sourcePath: r'C:\docs\long-cell.xlsx',
+      displayName: 'long-cell.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime(2026, 7, 24),
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Translations',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 1,
+          columnCount: 1,
+          preview: [
+            [longValue],
+          ],
+        ),
+      ],
+      selectedSheetNames: const ['Translations'],
+    );
+
+    await tester.pumpWidget(
+      testApp(
+        WorkspaceState(
+          tasks: [task],
+          selectedTaskId: task.id,
+          initialized: true,
+        ),
+      ),
+    );
+
+    final cellText = tester.widget<Text>(find.text(longValue));
+    expect(cellText.maxLines, isNull);
+    expect(tester.getSize(find.text(longValue)).height, greaterThan(42));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('shows draggable scrollbars for the workbook preview', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final preview = List.generate(
+      20,
+      (row) => List.generate(
+        8,
+        (column) => 'Row $row column $column contains scrolling content',
+      ),
+    );
+    final task = ConversionTask(
+      id: 'xlsx-scrollbars',
+      sourcePath: r'C:\docs\scrollbars.xlsx',
+      displayName: 'scrollbars.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime(2026, 7, 24),
+      workbookSheets: [
+        WorkbookSheetInfo(
+          name: 'Large sheet',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: preview.length,
+          columnCount: preview.first.length,
+          preview: preview,
+        ),
+      ],
+      selectedSheetNames: const ['Large sheet'],
+    );
+
+    try {
+      await tester.pumpWidget(
+        testApp(
+          WorkspaceState(
+            tasks: [task],
+            selectedTaskId: task.id,
+            initialized: true,
+          ),
+        ),
+      );
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+    await tester.pump();
+
+    final scrollViews = tester
+        .widgetList<SingleChildScrollView>(find.byType(SingleChildScrollView))
+        .toList();
+    final horizontalScroll = scrollViews.singleWhere(
+      (view) => view.scrollDirection == Axis.horizontal,
+    );
+    final verticalScroll = scrollViews.singleWhere(
+      (view) => view.scrollDirection == Axis.vertical,
+    );
+    final scrollbars = tester
+        .widgetList<Scrollbar>(find.byType(Scrollbar))
+        .toList();
+    final horizontalScrollbar = scrollbars.singleWhere(
+      (scrollbar) =>
+          identical(scrollbar.controller, horizontalScroll.controller),
+    );
+    final verticalScrollbar = scrollbars.singleWhere(
+      (scrollbar) => identical(scrollbar.controller, verticalScroll.controller),
+    );
+
+    expect(horizontalScrollbar.thumbVisibility, isTrue);
+    expect(horizontalScrollbar.interactive, isTrue);
+    expect(
+      horizontalScrollbar.scrollbarOrientation,
+      ScrollbarOrientation.bottom,
+    );
+    expect(verticalScrollbar.thumbVisibility, isTrue);
+    expect(verticalScrollbar.interactive, isTrue);
+    expect(verticalScrollbar.scrollbarOrientation, ScrollbarOrientation.right);
+    expect(
+      horizontalScroll.controller!.position.maxScrollExtent,
+      greaterThan(0),
+    );
+    expect(verticalScroll.controller!.position.maxScrollExtent, greaterThan(0));
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('provides a dedicated draggable scrollbar for the editor', (

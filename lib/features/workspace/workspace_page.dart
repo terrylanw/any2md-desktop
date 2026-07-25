@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
@@ -17,6 +18,7 @@ import '../../core/supported_formats.dart';
 import '../../domain/conversion_task.dart';
 import '../../domain/workspace_state.dart';
 import '../../services/settings_service.dart';
+import '../../services/windows_tray_service.dart';
 import 'markdown_preview_parser.dart';
 import 'workspace_controller.dart';
 
@@ -35,10 +37,17 @@ class WorkspacePage extends ConsumerStatefulWidget {
 
 class _WorkspacePageState extends ConsumerState<WorkspacePage>
     with WindowListener {
+  static const _sidebarMinWidth = 180.0;
+  static const _sidebarMaxWidth = 400.0;
+
   final _splitController = MultiSplitViewController();
   bool _dragging = false;
   late final bool _windowEnabled;
+  late final bool _trayEnabled;
   late final SettingsService _settingsService;
+  WindowsTrayService? _trayService;
+  bool _trayReady = false;
+  bool _exitInProgress = false;
   Timer? _windowSaveTimer;
   Timer? _sidebarSaveTimer;
 
@@ -46,9 +55,13 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
   void initState() {
     super.initState();
     _windowEnabled = ref.read(desktopWindowEnabledProvider);
+    _trayEnabled = _windowEnabled && Platform.isWindows;
     _settingsService = ref.read(settingsServiceProvider);
+    if (_trayEnabled) {
+      _trayService = WindowsTrayService(ref.read(appLoggerProvider).write);
+    }
     _splitController.areas = [
-      Area(size: 288, min: 240, max: 400),
+      Area(size: 288, min: _sidebarMinWidth, max: _sidebarMaxWidth),
       Area(flex: 1, min: 480),
     ];
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -58,13 +71,31 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
         windowManager.addListener(this);
         unawaited(windowManager.setPreventClose(true));
       }
+      if (_trayEnabled) unawaited(_initializeTray());
     });
+  }
+
+  Future<void> _initializeTray() async {
+    final service = _trayService;
+    if (service == null) return;
+    final ready = await service.initialize(
+      onShowRequested: _showWindow,
+      onExitRequested: _requestExit,
+    );
+    if (!mounted) {
+      if (ready) await service.shutdown();
+      return;
+    }
+    _trayReady = ready;
   }
 
   Future<void> _restoreSidebarWidth() async {
     final width = await _settingsService.loadSidebarWidth();
     if (!mounted) return;
-    _splitController.areas[0].size = width.clamp(240, 400);
+    _splitController.areas[0].size = width.clamp(
+      _sidebarMinWidth,
+      _sidebarMaxWidth,
+    );
   }
 
   @override
@@ -72,6 +103,7 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
     if (_windowEnabled) {
       windowManager.removeListener(this);
     }
+    _trayService?.dispose();
     _splitController.dispose();
     _windowSaveTimer?.cancel();
     _sidebarSaveTimer?.cancel();
@@ -80,20 +112,45 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
 
   @override
   Future<void> onWindowClose() async {
-    await ref
-        .read(workspaceControllerProvider.notifier)
-        .flushAllMarkdown(persistDirty: true);
-    final state = ref.read(workspaceControllerProvider);
-    if (state.hasUnsavedChanges) {
-      final close = await _confirm(
-        title: '退出 Any2MD？',
-        message: '仍有未导出的 Markdown，草稿会保留并在下次启动时恢复。',
-        confirmLabel: '退出',
-      );
-      if (!close) return;
+    if (_trayReady && !_exitInProgress) {
+      await windowManager.hide();
+      return;
     }
-    await windowManager.setPreventClose(false);
-    await windowManager.destroy();
+    await _requestExit();
+  }
+
+  Future<void> _showWindow() async {
+    if (await windowManager.isMinimized()) await windowManager.restore();
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  Future<void> _requestExit() async {
+    if (_exitInProgress) return;
+    _exitInProgress = true;
+    try {
+      await ref
+          .read(workspaceControllerProvider.notifier)
+          .flushAllMarkdown(persistDirty: true);
+      if (!mounted) return;
+      final state = ref.read(workspaceControllerProvider);
+      if (state.hasUnsavedChanges) {
+        await _showWindow();
+        if (!mounted) return;
+        final close = await _confirm(
+          title: '退出 Any2MD？',
+          message: '仍有未导出的 Markdown，草稿会保留并在下次启动时恢复。',
+          confirmLabel: '退出',
+        );
+        if (!close) return;
+      }
+      _trayReady = false;
+      await _trayService?.shutdown();
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+    } finally {
+      _exitInProgress = false;
+    }
   }
 
   @override
@@ -171,6 +228,16 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
                                           workspaceControllerProvider.notifier,
                                         )
                                         .retryTask(id),
+                                    onSheetSelectionChanged: (id, names) => ref
+                                        .read(
+                                          workspaceControllerProvider.notifier,
+                                        )
+                                        .updateSheetSelection(id, names),
+                                    onConfirmSheetSelection: (id, names) => ref
+                                        .read(
+                                          workspaceControllerProvider.notifier,
+                                        )
+                                        .confirmSheetSelection(id, names),
                                   ),
                           )
                         : const Center(child: CircularProgressIndicator()),
@@ -367,11 +434,17 @@ class _DocumentWorkspaceConsumer extends ConsumerWidget {
     required this.onMarkdownChanged,
     required this.onFlush,
     required this.onRetry,
+    required this.onSheetSelectionChanged,
+    required this.onConfirmSheetSelection,
   });
 
   final void Function(String id, String markdown) onMarkdownChanged;
   final Future<void> Function() onFlush;
   final ValueChanged<String> onRetry;
+  final Future<void> Function(String id, Iterable<String> names)
+  onSheetSelectionChanged;
+  final Future<void> Function(String id, Iterable<String> names)
+  onConfirmSheetSelection;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -383,6 +456,8 @@ class _DocumentWorkspaceConsumer extends ConsumerWidget {
       onMarkdownChanged: onMarkdownChanged,
       onFlush: onFlush,
       onRetry: onRetry,
+      onSheetSelectionChanged: onSheetSelectionChanged,
+      onConfirmSheetSelection: onConfirmSheetSelection,
     );
   }
 }
@@ -398,7 +473,9 @@ class _StatusBarConsumer extends ConsumerWidget {
           taskCount: state.tasks.length,
           completedCount: state.completedCount,
           converting: state.tasks.any(
-            (task) => task.status == ConversionStatus.converting,
+            (task) =>
+                task.status == ConversionStatus.converting ||
+                task.status == ConversionStatus.inspecting,
           ),
         ),
       ),
@@ -433,7 +510,9 @@ class _Toolbar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final selected = selectedTask;
-    final converting = selected?.status == ConversionStatus.converting;
+    final converting =
+        selected?.status == ConversionStatus.converting ||
+        selected?.status == ConversionStatus.inspecting;
     final exportable = selected?.status == ConversionStatus.ready;
     return SizedBox(
       height: 54,
@@ -615,6 +694,20 @@ class _TaskStatusIcon extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     return switch (task.status) {
+      ConversionStatus.inspectionQueued => Icon(
+        Icons.table_view_outlined,
+        size: 19,
+        color: colors.onSurfaceVariant,
+      ),
+      ConversionStatus.inspecting => const SizedBox.square(
+        dimension: 18,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      ),
+      ConversionStatus.awaitingSheetSelection => Icon(
+        Icons.checklist_outlined,
+        size: 20,
+        color: colors.secondary,
+      ),
       ConversionStatus.queued => Icon(
         Icons.schedule,
         size: 19,
@@ -649,12 +742,18 @@ class _DocumentWorkspace extends StatefulWidget {
     required this.onMarkdownChanged,
     required this.onFlush,
     required this.onRetry,
+    required this.onSheetSelectionChanged,
+    required this.onConfirmSheetSelection,
   });
 
   final ConversionTask? task;
   final void Function(String id, String markdown) onMarkdownChanged;
   final Future<void> Function() onFlush;
   final ValueChanged<String> onRetry;
+  final Future<void> Function(String id, Iterable<String> names)
+  onSheetSelectionChanged;
+  final Future<void> Function(String id, Iterable<String> names)
+  onConfirmSheetSelection;
 
   @override
   State<_DocumentWorkspace> createState() => _DocumentWorkspaceState();
@@ -662,14 +761,40 @@ class _DocumentWorkspace extends StatefulWidget {
 
 class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
   EditorMode _mode = EditorMode.edit;
+  bool _reselectingSheets = false;
+
+  @override
+  void didUpdateWidget(covariant _DocumentWorkspace oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.task?.id != widget.task?.id ||
+        widget.task?.status != ConversionStatus.ready) {
+      _reselectingSheets = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final task = widget.task;
     if (task == null) return const _WorkspaceEmptyState();
-    if (task.status == ConversionStatus.queued ||
+    if (task.status == ConversionStatus.inspectionQueued ||
+        task.status == ConversionStatus.inspecting ||
+        task.status == ConversionStatus.queued ||
         task.status == ConversionStatus.converting) {
       return _BusyState(task: task);
+    }
+    if (task.status == ConversionStatus.awaitingSheetSelection ||
+        _reselectingSheets) {
+      return _WorkbookSheetSelector(
+        key: ValueKey('${task.id}-${_reselectingSheets ? 'reselect' : 'new'}'),
+        task: task,
+        allowCancel: _reselectingSheets,
+        onCancel: () => setState(() => _reselectingSheets = false),
+        onSelectionChanged:
+            task.status == ConversionStatus.awaitingSheetSelection
+            ? (names) => widget.onSheetSelectionChanged(task.id, names)
+            : null,
+        onConvert: (names) => _convertSelectedSheets(task, names),
+      );
     }
     if (task.status == ConversionStatus.failed ||
         task.status == ConversionStatus.cancelled) {
@@ -679,7 +804,12 @@ class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _DocumentHeader(task: task),
+        _DocumentHeader(
+          task: task,
+          onReselectSheets: task.inputType == 'xlsx'
+              ? () => setState(() => _reselectingSheets = true)
+              : null,
+        ),
         if (task.warnings.isNotEmpty) _WarningBanner(warnings: task.warnings),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
@@ -729,12 +859,41 @@ class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
     await widget.onFlush();
     if (mounted) setState(() => _mode = mode);
   }
+
+  Future<void> _convertSelectedSheets(
+    ConversionTask task,
+    Set<String> names,
+  ) async {
+    if (task.hasManualEdits) {
+      final overwrite = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('重新转换工作表？'),
+          content: const Text('当前 Markdown 包含手动编辑，重新转换后这些修改会被覆盖。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('重新转换'),
+            ),
+          ],
+        ),
+      );
+      if (overwrite != true) return;
+    }
+    await widget.onConfirmSheetSelection(task.id, names);
+    if (mounted) setState(() => _reselectingSheets = false);
+  }
 }
 
 class _DocumentHeader extends StatelessWidget {
-  const _DocumentHeader({required this.task});
+  const _DocumentHeader({required this.task, this.onReselectSheets});
 
   final ConversionTask task;
+  final VoidCallback? onReselectSheets;
 
   @override
   Widget build(BuildContext context) {
@@ -750,6 +909,14 @@ class _DocumentHeader extends StatelessWidget {
               style: Theme.of(context).textTheme.titleSmall,
             ),
           ),
+          if (onReselectSheets != null) ...[
+            TextButton.icon(
+              onPressed: onReselectSheets,
+              icon: const Icon(Icons.table_view_outlined, size: 17),
+              label: Text('${task.selectedSheetNames.length} 个工作表'),
+            ),
+            const SizedBox(width: 8),
+          ],
           if (task.isDirty)
             Text(
               '未导出',
@@ -761,6 +928,749 @@ class _DocumentHeader extends StatelessWidget {
       ),
     );
   }
+}
+
+class _WorkbookSheetSelector extends StatefulWidget {
+  const _WorkbookSheetSelector({
+    super.key,
+    required this.task,
+    required this.allowCancel,
+    required this.onCancel,
+    required this.onConvert,
+    this.onSelectionChanged,
+  });
+
+  final ConversionTask task;
+  final bool allowCancel;
+  final VoidCallback onCancel;
+  final ValueChanged<Set<String>>? onSelectionChanged;
+  final Future<void> Function(Set<String> names) onConvert;
+
+  @override
+  State<_WorkbookSheetSelector> createState() => _WorkbookSheetSelectorState();
+}
+
+class _WorkbookSheetSelectorState extends State<_WorkbookSheetSelector> {
+  final _searchController = TextEditingController();
+  late final Set<String> _selectedNames;
+  String _query = '';
+  String? _previewSheetName;
+  bool _showHidden = false;
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedNames = widget.task.selectedSheetNames.toSet();
+    _previewSheetName = widget.task.workbookSheets
+        .where((sheet) => _selectedNames.contains(sheet.name))
+        .firstOrNull
+        ?.name;
+    _previewSheetName ??= widget.task.workbookSheets
+        .where((sheet) => sheet.isSelectable)
+        .firstOrNull
+        ?.name;
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sheets = widget.task.workbookSheets;
+    final filtered = _filteredSheets(_query, _showHidden);
+    final previewSheet = sheets
+        .where((sheet) => sheet.name == _previewSheetName)
+        .firstOrNull;
+    final selectableCount = sheets.where((sheet) => sheet.isSelectable).length;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          height: 68,
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          color: Theme.of(context).colorScheme.surface,
+          child: Row(
+            children: [
+              Icon(
+                Icons.table_chart_outlined,
+                size: 20,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.task.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${sheets.length} 个工作表 · 已选 ${_selectedNames.length}',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (widget.allowCancel)
+                TextButton(onPressed: widget.onCancel, child: const Text('取消')),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                onPressed: _selectedNames.isEmpty || _submitting
+                    ? null
+                    : _submit,
+                icon: _submitting
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.play_arrow, size: 18),
+                label: Text('转换所选 (${_selectedNames.length})'),
+              ),
+            ],
+          ),
+        ),
+        Divider(height: 1, color: Theme.of(context).dividerColor),
+        Container(
+          height: 52,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final compact = constraints.maxWidth < 700;
+              final search = SizedBox(
+                height: 34,
+                child: TextField(
+                  controller: _searchController,
+                  decoration: InputDecoration(
+                    hintText: '搜索工作表',
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    isDense: true,
+                    filled: true,
+                    fillColor: Theme.of(context).colorScheme.surface,
+                    border: const OutlineInputBorder(
+                      borderSide: BorderSide.none,
+                    ),
+                    enabledBorder: const OutlineInputBorder(
+                      borderSide: BorderSide.none,
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                  ),
+                  onChanged: _updateQuery,
+                ),
+              );
+              return Row(
+                children: [
+                  if (compact)
+                    Expanded(child: search)
+                  else
+                    SizedBox(width: 260, child: search),
+                  const SizedBox(width: 6),
+                  IconButton(
+                    onPressed: _selectVisibleSheets,
+                    tooltip: '全选可见非空工作表',
+                    icon: const Icon(Icons.select_all, size: 20),
+                  ),
+                  IconButton(
+                    onPressed: _selectedNames.isEmpty ? null : _clearSelection,
+                    tooltip: '取消全选',
+                    icon: const Icon(Icons.deselect, size: 20),
+                  ),
+                  const Spacer(),
+                  if (compact)
+                    IconButton(
+                      onPressed: () => _updateShowHidden(!_showHidden),
+                      tooltip: _showHidden ? '隐藏不可见工作表' : '显示隐藏工作表',
+                      isSelected: _showHidden,
+                      icon: const Icon(Icons.visibility_off_outlined, size: 19),
+                      selectedIcon: const Icon(
+                        Icons.visibility_outlined,
+                        size: 19,
+                      ),
+                    )
+                  else
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.visibility_off_outlined,
+                          size: 18,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 7),
+                        const Text('显示隐藏工作表'),
+                        const SizedBox(width: 6),
+                        SizedBox(
+                          width: 42,
+                          height: 28,
+                          child: FittedBox(
+                            fit: BoxFit.contain,
+                            child: Switch(
+                              value: _showHidden,
+                              onChanged: _updateShowHidden,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+        if (selectableCount == 0)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            color: Theme.of(context).colorScheme.errorContainer,
+            child: Text(
+              '工作簿中没有可转换的数据。',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+        Divider(height: 1, color: Theme.of(context).dividerColor),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final list = _SheetList(
+                sheets: filtered,
+                selectedNames: _selectedNames,
+                previewSheetName: _previewSheetName,
+                onToggle: _toggleSheet,
+                onPreview: (name) => setState(() => _previewSheetName = name),
+              );
+              final preview = _SheetPreview(sheet: previewSheet);
+              if (constraints.maxWidth >= 760) {
+                return Row(
+                  children: [
+                    SizedBox(width: 316, child: list),
+                    VerticalDivider(
+                      width: 1,
+                      color: Theme.of(context).dividerColor,
+                    ),
+                    Expanded(child: preview),
+                  ],
+                );
+              }
+              return Column(
+                children: [
+                  SizedBox(height: 230, child: list),
+                  Divider(height: 1, color: Theme.of(context).dividerColor),
+                  Expanded(child: preview),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _toggleSheet(WorkbookSheetInfo sheet, bool selected) {
+    if (!sheet.isSelectable) return;
+    setState(() {
+      if (selected) {
+        _selectedNames.add(sheet.name);
+      } else {
+        _selectedNames.remove(sheet.name);
+      }
+      _previewSheetName = sheet.name;
+    });
+    widget.onSelectionChanged?.call(Set.unmodifiable(_selectedNames));
+  }
+
+  void _selectVisibleSheets() {
+    setState(() {
+      _selectedNames
+        ..clear()
+        ..addAll(
+          widget.task.workbookSheets
+              .where((sheet) => sheet.isVisible && sheet.isSelectable)
+              .map((sheet) => sheet.name),
+        );
+    });
+    widget.onSelectionChanged?.call(Set.unmodifiable(_selectedNames));
+  }
+
+  void _clearSelection() {
+    setState(_selectedNames.clear);
+    widget.onSelectionChanged?.call(const {});
+  }
+
+  void _updateQuery(String value) {
+    setState(() {
+      _query = value;
+      _keepPreviewIn(_filteredSheets(value, _showHidden));
+    });
+  }
+
+  void _updateShowHidden(bool value) {
+    setState(() {
+      _showHidden = value;
+      _keepPreviewIn(_filteredSheets(_query, value));
+    });
+  }
+
+  List<WorkbookSheetInfo> _filteredSheets(String query, bool showHidden) {
+    final normalizedQuery = query.trim().toLowerCase();
+    return widget.task.workbookSheets
+        .where(
+          (sheet) =>
+              (showHidden || sheet.isVisible) &&
+              (normalizedQuery.isEmpty ||
+                  sheet.name.toLowerCase().contains(normalizedQuery)),
+        )
+        .toList(growable: false);
+  }
+
+  void _keepPreviewIn(List<WorkbookSheetInfo> visibleSheets) {
+    if (!visibleSheets.any((sheet) => sheet.name == _previewSheetName)) {
+      _previewSheetName = visibleSheets.firstOrNull?.name;
+    }
+  }
+
+  Future<void> _submit() async {
+    setState(() => _submitting = true);
+    try {
+      await widget.onConvert(Set.unmodifiable(_selectedNames));
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+}
+
+class _SheetList extends StatelessWidget {
+  const _SheetList({
+    required this.sheets,
+    required this.selectedNames,
+    required this.previewSheetName,
+    required this.onToggle,
+    required this.onPreview,
+  });
+
+  final List<WorkbookSheetInfo> sheets;
+  final Set<String> selectedNames;
+  final String? previewSheetName;
+  final void Function(WorkbookSheetInfo sheet, bool selected) onToggle;
+  final ValueChanged<String> onPreview;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: Theme.of(context).colorScheme.surface,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            alignment: Alignment.centerLeft,
+            color: Theme.of(context).colorScheme.surfaceContainerLowest,
+            child: Text(
+              '工作表',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          Divider(height: 1, color: Theme.of(context).dividerColor),
+          Expanded(
+            child: sheets.isEmpty
+                ? Center(
+                    child: Text(
+                      '没有匹配的工作表',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: sheets.length,
+                    itemBuilder: (context, index) {
+                      final sheet = sheets[index];
+                      final selected = selectedNames.contains(sheet.name);
+                      final previewing = previewSheetName == sheet.name;
+                      return Material(
+                        color: previewing
+                            ? Theme.of(context).colorScheme.surfaceContainerHigh
+                            : Colors.transparent,
+                        child: InkWell(
+                          onTap: () => onPreview(sheet.name),
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border: Border(
+                                left: BorderSide(
+                                  width: 3,
+                                  color: previewing
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Colors.transparent,
+                                ),
+                              ),
+                            ),
+                            padding: const EdgeInsets.fromLTRB(5, 6, 12, 6),
+                            child: Row(
+                              children: [
+                                Checkbox(
+                                  key: ValueKey(
+                                    'sheet-checkbox-${sheet.index}',
+                                  ),
+                                  value: selected,
+                                  visualDensity: VisualDensity.compact,
+                                  onChanged: sheet.isSelectable
+                                      ? (value) =>
+                                            onToggle(sheet, value ?? false)
+                                      : null,
+                                ),
+                                const SizedBox(width: 2),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        sheet.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      const SizedBox(height: 1),
+                                      Text(
+                                        _sheetMetadataLabel(sheet),
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(
+                                              color: Theme.of(
+                                                context,
+                                              ).colorScheme.onSurfaceVariant,
+                                            ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (!sheet.isVisible)
+                                  Icon(
+                                    Icons.visibility_off_outlined,
+                                    size: 17,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SheetPreview extends StatefulWidget {
+  const _SheetPreview({required this.sheet});
+
+  final WorkbookSheetInfo? sheet;
+
+  @override
+  State<_SheetPreview> createState() => _SheetPreviewState();
+}
+
+class _SheetPreviewState extends State<_SheetPreview> {
+  static const _scrollbarGutter = 16.0;
+
+  final _horizontalScrollController = ScrollController();
+  final _verticalScrollController = ScrollController();
+
+  @override
+  void didUpdateWidget(covariant _SheetPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.sheet?.name != widget.sheet?.name) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_horizontalScrollController.hasClients) {
+          _horizontalScrollController.jumpTo(0);
+        }
+        if (_verticalScrollController.hasClients) {
+          _verticalScrollController.jumpTo(0);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _horizontalScrollController.dispose();
+    _verticalScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sheet = widget.sheet;
+    if (sheet == null) {
+      return const Center(child: Text('选择工作表以查看预览'));
+    }
+    if (sheet.preview.isEmpty) {
+      return Center(child: Text(sheet.isEmpty ? '空工作表' : '没有可预览的数据'));
+    }
+    final columnCount = sheet.preview
+        .map((row) => row.length)
+        .fold<int>(0, (maximum, length) => math.max(maximum, length));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          height: 48,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          color: Theme.of(context).colorScheme.surfaceContainerLowest,
+          child: Row(
+            children: [
+              Icon(
+                Icons.grid_on_outlined,
+                size: 17,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  sheet.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              Text(
+                '${sheet.rowCount} 行 × ${sheet.columnCount} 列',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Divider(height: 1, color: Theme.of(context).dividerColor),
+        Expanded(
+          child: ColoredBox(
+            color: Theme.of(context).colorScheme.surface,
+            child: ScrollbarTheme(
+              data: ScrollbarTheme.of(context).copyWith(
+                thickness: WidgetStateProperty.resolveWith(
+                  (states) =>
+                      states.contains(WidgetState.hovered) ||
+                          states.contains(WidgetState.dragged)
+                      ? 12
+                      : 10,
+                ),
+                trackVisibility: WidgetStateProperty.resolveWith(
+                  (states) =>
+                      states.contains(WidgetState.hovered) ||
+                      states.contains(WidgetState.dragged),
+                ),
+                minThumbLength: 48,
+                crossAxisMargin: 2,
+                radius: const Radius.circular(6),
+              ),
+              child: Scrollbar(
+                controller: _verticalScrollController,
+                thumbVisibility: true,
+                interactive: true,
+                scrollbarOrientation: ScrollbarOrientation.right,
+                notificationPredicate: (notification) =>
+                    notification.metrics.axis == Axis.vertical,
+                child: Scrollbar(
+                  controller: _horizontalScrollController,
+                  thumbVisibility: true,
+                  interactive: true,
+                  scrollbarOrientation: ScrollbarOrientation.bottom,
+                  notificationPredicate: (notification) =>
+                      notification.metrics.axis == Axis.horizontal,
+                  child: Padding(
+                    padding: const EdgeInsets.only(
+                      right: _scrollbarGutter,
+                      bottom: _scrollbarGutter,
+                    ),
+                    child: ScrollConfiguration(
+                      behavior: ScrollConfiguration.of(
+                        context,
+                      ).copyWith(scrollbars: false),
+                      child: SingleChildScrollView(
+                        controller: _horizontalScrollController,
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.all(16),
+                        child: SingleChildScrollView(
+                          controller: _verticalScrollController,
+                          child: _SheetPreviewGrid(
+                            preview: sheet.preview,
+                            columnCount: columnCount,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SheetPreviewGrid extends StatelessWidget {
+  const _SheetPreviewGrid({required this.preview, required this.columnCount});
+
+  static const _rowHeaderWidth = 42.0;
+  static const _columnWidth = 148.0;
+  static const _headerHeight = 32.0;
+  static const _rowHeight = 42.0;
+
+  final List<List<String?>> preview;
+  final int columnCount;
+
+  @override
+  Widget build(BuildContext context) {
+    final borderColor = Theme.of(context).dividerColor;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border(
+          top: BorderSide(color: borderColor),
+          left: BorderSide(color: borderColor),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const _SheetGridCell(
+                width: _rowHeaderWidth,
+                height: _headerHeight,
+                text: '',
+                header: true,
+              ),
+              for (var index = 0; index < columnCount; index++)
+                _SheetGridCell(
+                  width: _columnWidth,
+                  height: _headerHeight,
+                  text: _spreadsheetColumnName(index),
+                  header: true,
+                ),
+            ],
+          ),
+          for (var rowIndex = 0; rowIndex < preview.length; rowIndex++)
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _SheetGridCell(
+                    width: _rowHeaderWidth,
+                    height: _rowHeight,
+                    text: '${rowIndex + 1}',
+                    header: true,
+                  ),
+                  for (
+                    var columnIndex = 0;
+                    columnIndex < columnCount;
+                    columnIndex++
+                  )
+                    _SheetGridCell(
+                      width: _columnWidth,
+                      height: _rowHeight,
+                      text: columnIndex < preview[rowIndex].length
+                          ? preview[rowIndex][columnIndex] ?? ''
+                          : '',
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SheetGridCell extends StatelessWidget {
+  const _SheetGridCell({
+    required this.width,
+    required this.height,
+    required this.text,
+    this.header = false,
+  });
+
+  final double width;
+  final double height;
+  final String text;
+  final bool header;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      constraints: BoxConstraints(minHeight: height),
+      padding: EdgeInsets.symmetric(horizontal: header ? 6 : 10, vertical: 6),
+      alignment: header ? Alignment.center : Alignment.centerLeft,
+      decoration: BoxDecoration(
+        color: header
+            ? Theme.of(context).colorScheme.surfaceContainerLow
+            : Theme.of(context).colorScheme.surface,
+        border: Border(
+          right: BorderSide(color: Theme.of(context).dividerColor),
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
+      ),
+      child: Text(
+        text,
+        maxLines: header ? 1 : null,
+        overflow: header ? TextOverflow.ellipsis : TextOverflow.clip,
+        style: header
+            ? Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              )
+            : Theme.of(context).textTheme.bodyMedium,
+      ),
+    );
+  }
+}
+
+String _sheetMetadataLabel(WorkbookSheetInfo sheet) {
+  if (sheet.isEmpty) return '空工作表';
+  final visibility = switch (sheet.visibility) {
+    SheetVisibility.visible => '',
+    SheetVisibility.hidden => ' · 已隐藏',
+    SheetVisibility.veryHidden => ' · 深度隐藏',
+  };
+  return '${sheet.rowCount} 行 × ${sheet.columnCount} 列$visibility';
+}
+
+String _spreadsheetColumnName(int zeroBasedIndex) {
+  var value = zeroBasedIndex + 1;
+  final characters = <int>[];
+  while (value > 0) {
+    value--;
+    characters.add(65 + value % 26);
+    value ~/= 26;
+  }
+  return String.fromCharCodes(characters.reversed);
 }
 
 class _MarkdownEditor extends StatefulWidget {
@@ -1523,10 +2433,12 @@ class _BusyState extends StatelessWidget {
             child: CircularProgressIndicator(strokeWidth: 3),
           ),
           const SizedBox(height: 18),
-          Text(
-            task.status == ConversionStatus.queued ? '等待转换' : '正在转换',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          Text(switch (task.status) {
+            ConversionStatus.inspectionQueued => '等待读取工作簿',
+            ConversionStatus.inspecting => '正在读取工作簿',
+            ConversionStatus.queued => '等待转换',
+            _ => '正在转换',
+          }, style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
           Text(task.displayName, style: Theme.of(context).textTheme.bodySmall),
         ],
@@ -1696,6 +2608,9 @@ class _DropOverlay extends StatelessWidget {
 }
 
 String _statusLabel(ConversionTask task) => switch (task.status) {
+  ConversionStatus.inspectionQueued => '等待读取工作簿',
+  ConversionStatus.inspecting => '正在读取工作簿',
+  ConversionStatus.awaitingSheetSelection => '待选择工作表',
   ConversionStatus.queued => '等待转换',
   ConversionStatus.converting => '正在转换',
   ConversionStatus.ready => task.isDirty ? '未导出' : '已导出',
@@ -1711,5 +2626,6 @@ String _errorTitle(String? code) => switch (code) {
   'timeout' => '转换超时',
   'worker_crashed' => '转换服务不可用',
   'protocol_error' => '转换服务版本不兼容',
+  'sheet_selection_invalid' => '工作表选择已失效',
   _ => '转换失败',
 };

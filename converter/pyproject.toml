@@ -5,6 +5,8 @@ description = "Local JSONL worker for Any2MD Desktop"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "markitdown[docx,pdf,pptx,xlsx]==0.1.5",
+    "openpyxl==3.1.5",
+    "pandas==3.0.5",
 ]
 
 [dependency-groups]

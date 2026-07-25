@@ -21,6 +21,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
+    { name = "openpyxl" },
+    { name = "pandas" },
 ]
 
 [package.dev-dependencies]
@@ -32,7 +34,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "markitdown", extras = ["docx", "pdf", "pptx", "xlsx"], specifier = "==0.1.5" }]
+requires-dist = [
+    { name = "markitdown", extras = ["docx", "pdf", "pptx", "xlsx"], specifier = "==0.1.5" },
+    { name = "openpyxl", specifier = "==3.1.5" },
+    { name = "pandas", specifier = "==3.0.5" },
+]
 
 [package.metadata.requires-dev]
 dev = [

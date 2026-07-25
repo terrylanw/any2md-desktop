@@ -49,4 +49,90 @@ void main() {
     expect(queued.errorRetryable, isFalse);
     expect(queued.exportedPath, isNull);
   });
+
+  test('workbook metadata and selection survive draft JSON', () {
+    final task = ConversionTask(
+      id: 'xlsx-1',
+      sourcePath: r'C:\docs\report.xlsx',
+      displayName: 'report.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime.utc(2026, 7, 24),
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Summary',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 2,
+          columnCount: 2,
+          preview: [
+            ['Name', 'Value'],
+            ['Alpha', '42'],
+          ],
+        ),
+      ],
+      selectedSheetNames: const ['Summary'],
+      hasManualEdits: true,
+      workbookInspectionVersion:
+          ConversionTask.currentWorkbookInspectionVersion,
+    );
+
+    final restored = ConversionTask.fromJson(task.toJson());
+
+    expect(restored.status, ConversionStatus.awaitingSheetSelection);
+    expect(restored.workbookSheets.single.name, 'Summary');
+    expect(restored.workbookSheets.single.preview[1], ['Alpha', '42']);
+    expect(restored.selectedSheetNames, ['Summary']);
+    expect(restored.hasManualEdits, isTrue);
+    expect(
+      restored.workbookInspectionVersion,
+      ConversionTask.currentWorkbookInspectionVersion,
+    );
+  });
+
+  test('active workbook states normalize when a draft is restored', () {
+    final inspecting = ConversionTask(
+      id: 'xlsx-1',
+      sourcePath: r'C:\docs\report.xlsx',
+      displayName: 'report.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.inspecting,
+      createdAt: DateTime.utc(2026, 7, 24),
+    );
+
+    final restored = ConversionTask.fromJson(inspecting.toJson());
+
+    expect(restored.status, ConversionStatus.inspectionQueued);
+  });
+
+  test('legacy workbook inspection is refreshed when a draft is restored', () {
+    final task = ConversionTask(
+      id: 'xlsx-legacy',
+      sourcePath: r'C:\docs\report.xlsx',
+      displayName: 'report.xlsx',
+      inputType: 'xlsx',
+      status: ConversionStatus.awaitingSheetSelection,
+      createdAt: DateTime.utc(2026, 7, 24),
+      workbookSheets: const [
+        WorkbookSheetInfo(
+          name: 'Summary',
+          index: 0,
+          visibility: SheetVisibility.visible,
+          isEmpty: false,
+          rowCount: 1,
+          columnCount: 1,
+          preview: [
+            ['Name'],
+          ],
+        ),
+      ],
+      selectedSheetNames: const ['Summary'],
+    );
+
+    final restored = ConversionTask.fromJson(task.toJson());
+
+    expect(restored.status, ConversionStatus.inspectionQueued);
+    expect(restored.selectedSheetNames, ['Summary']);
+  });
 }
