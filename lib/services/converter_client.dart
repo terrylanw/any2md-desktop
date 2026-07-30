@@ -67,6 +67,7 @@ class ConverterClient {
   String? _activeRequestId;
   int _generation = 0;
   bool _disposed = false;
+  Future<void>? _disposeFuture;
 
   Future<ConversionOutput> convert({
     required String inputPath,
@@ -312,9 +313,66 @@ class ConverterClient {
     _stderrSubscription = null;
   }
 
-  Future<void> dispose() async {
+  Future<void> dispose() => _disposeFuture ??= _dispose();
+
+  Future<void> _dispose() async {
     _disposed = true;
-    await cancelCurrent();
+    ++_generation;
+
+    final process = _process;
+    final stdoutSubscription = _stdoutSubscription;
+    final stderrSubscription = _stderrSubscription;
+    final ready = _readyCompleter;
+    final active = _activeCompleter;
+    final wasBusy = active != null && !active.isCompleted;
+
+    _process = null;
+    _readyCompleter = null;
+    _activeCompleter = null;
+    _activeRequestId = null;
+    _stdoutSubscription = null;
+    _stderrSubscription = null;
+
+    if (ready != null && !ready.isCompleted) {
+      ready.completeError(const ConverterException('cancelled', '转换已取消'));
+    }
+    if (wasBusy) {
+      active.completeError(const ConverterException('cancelled', '转换已取消'));
+    }
+
+    if (process != null) {
+      var exited = false;
+      if (!wasBusy) {
+        try {
+          process.stdin.writeln(
+            jsonEncode({
+              'v': _protocolVersion,
+              'id': _uuid.v4(),
+              'method': 'shutdown',
+            }),
+          );
+          await process.stdin.flush();
+          await process.stdin.close();
+          await process.exitCode.timeout(const Duration(milliseconds: 500));
+          exited = true;
+        } on Object {
+          // Fall through to forced termination if graceful shutdown stalls.
+        }
+      }
+      if (!exited) {
+        process.kill();
+        try {
+          await process.exitCode.timeout(const Duration(milliseconds: 500));
+        } on Object {
+          // The host process must not be held open by an unresponsive worker.
+        }
+      }
+    }
+
+    await Future.wait<void>([
+      if (stdoutSubscription != null) stdoutSubscription.cancel(),
+      if (stderrSubscription != null) stderrSubscription.cancel(),
+    ]);
   }
 
   static ConverterLaunchSpec _resolveLaunchSpec() {

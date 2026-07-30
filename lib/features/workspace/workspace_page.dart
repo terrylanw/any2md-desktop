@@ -145,8 +145,13 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
         if (!close) return;
       }
       _trayReady = false;
-      await _trayService?.shutdown();
-      await windowManager.setPreventClose(false);
+      _windowSaveTimer?.cancel();
+      _sidebarSaveTimer?.cancel();
+      await windowManager.hide();
+      await Future.wait<void>([
+        ref.read(workspaceControllerProvider.notifier).stopForExit(),
+        if (_trayService case final trayService?) trayService.shutdown(),
+      ]);
       await windowManager.destroy();
     } finally {
       _exitInProgress = false;

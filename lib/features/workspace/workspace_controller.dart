@@ -55,6 +55,8 @@ class WorkspaceController extends Notifier<WorkspaceState> {
   final _cancelledTaskIds = <String>{};
   bool _processing = false;
   bool _initializing = false;
+  bool _exiting = false;
+  Future<void>? _stopForExitFuture;
 
   @override
   WorkspaceState build() {
@@ -213,17 +215,19 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     unawaited(_commitMarkdown(taskId, markdown));
   }
 
-  Future<void> flushMarkdown(String taskId) async {
+  Future<void> flushMarkdown(String taskId, {bool persistNow = true}) async {
     final markdown = _pendingMarkdown.remove(taskId);
     _draftTimers.remove(taskId)?.cancel();
     if (markdown != null) {
-      await _commitMarkdown(taskId, markdown, persistNow: true);
+      await _commitMarkdown(taskId, markdown, persistNow: persistNow);
     }
   }
 
   Future<void> flushAllMarkdown({bool persistDirty = false}) async {
     await Future.wait(
-      _pendingMarkdown.keys.toList(growable: false).map(flushMarkdown),
+      _pendingMarkdown.keys
+          .toList(growable: false)
+          .map((taskId) => flushMarkdown(taskId, persistNow: !persistDirty)),
     );
     if (!persistDirty) return;
     final dirtyTasks = state.tasks
@@ -235,6 +239,11 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     await Future.wait(
       dirtyTasks.map((task) => ref.read(draftStoreProvider).save(task)),
     );
+  }
+
+  Future<void> stopForExit() {
+    _exiting = true;
+    return _stopForExitFuture ??= ref.read(converterClientProvider).dispose();
   }
 
   Future<void> _commitMarkdown(
@@ -394,10 +403,10 @@ class WorkspaceController extends Notifier<WorkspaceState> {
   }
 
   Future<void> _drainQueue() async {
-    if (_processing) return;
+    if (_processing || _exiting) return;
     _processing = true;
     try {
-      while (true) {
+      while (!_exiting) {
         final queued = state.tasks.where(
           (task) =>
               task.status == ConversionStatus.inspectionQueued ||
@@ -434,6 +443,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
           _replaceTask(ready);
           await ref.read(draftStoreProvider).save(ready);
         } on ConverterException catch (error) {
+          if (_exiting) break;
           final current = _taskById(task.id);
           if (current == null) continue;
           final wasCancelled =
@@ -462,6 +472,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
             await ref.read(draftStoreProvider).save(failed);
           }
         } on Object catch (error) {
+          if (_exiting) break;
           final current = _taskById(task.id);
           if (current == null) continue;
           final failed = current.copyWith(
@@ -476,11 +487,12 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       }
     } finally {
       _processing = false;
-      if (state.tasks.any(
-        (task) =>
-            task.status == ConversionStatus.inspectionQueued ||
-            task.status == ConversionStatus.queued,
-      )) {
+      if (!_exiting &&
+          state.tasks.any(
+            (task) =>
+                task.status == ConversionStatus.inspectionQueued ||
+                task.status == ConversionStatus.queued,
+          )) {
         unawaited(_drainQueue());
       }
     }
@@ -523,6 +535,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       _replaceTask(inspected);
       await ref.read(draftStoreProvider).save(inspected);
     } on ConverterException catch (error) {
+      if (_exiting) return;
       final current = _taskById(task.id);
       if (current == null) return;
       final wasCancelled =
@@ -539,6 +552,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       _replaceTask(failed);
       await ref.read(draftStoreProvider).save(failed);
     } on Object catch (error) {
+      if (_exiting) return;
       final current = _taskById(task.id);
       if (current == null) return;
       final failed = current.copyWith(
