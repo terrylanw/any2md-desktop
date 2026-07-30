@@ -10,7 +10,7 @@ import 'services/settings_service.dart';
 
 Future<void> main() async {
   if (const bool.fromEnvironment('ENABLE_FLUTTER_DRIVER')) {
-    enableFlutterDriverExtension();
+    enableFlutterDriverExtension(enableTextEntryEmulation: false);
   } else {
     WidgetsFlutterBinding.ensureInitialized();
   }

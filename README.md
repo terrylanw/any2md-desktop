@@ -45,7 +45,7 @@ flutter run -d windows
 flutter run -d windows --dart-define=ENABLE_FLUTTER_DRIVER=true
 ```
 
-macOS 将设备名替换为 `macos`。不要在发布构建中设置该开关；启用后真实键盘输入会被 Flutter Driver 拦截，请通过 MCP 的输入命令输入文本。
+macOS 将设备名替换为 `macos`。不要在发布构建中设置该开关。Driver 模式默认保留真实键盘输入；MCP 需要调用 `enter_text` 时，可以先通过 `set_text_entry_emulation` 临时开启文本输入仿真，完成后再关闭。
 
 ## 验证
 

@@ -1701,6 +1701,9 @@ class _MarkdownEditorState extends State<_MarkdownEditor> {
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.markdown);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
   }
 
   @override
@@ -1745,20 +1748,22 @@ class _MarkdownEditorState extends State<_MarkdownEditor> {
                     builder: (context, value, _) => Row(
                       children: [
                         IconButton(
-                          onPressed: value.canUndo
-                              ? _undoController.undo
-                              : null,
+                          onPressed: value.canUndo ? _undo : null,
                           tooltip: '撤销',
                           iconSize: 19,
                           icon: const Icon(Icons.undo),
                         ),
                         IconButton(
-                          onPressed: value.canRedo
-                              ? _undoController.redo
-                              : null,
+                          onPressed: value.canRedo ? _redo : null,
                           tooltip: '重做',
                           iconSize: 19,
                           icon: const Icon(Icons.redo),
+                        ),
+                        IconButton(
+                          onPressed: _copyAll,
+                          tooltip: '复制全部 Markdown',
+                          iconSize: 19,
+                          icon: const Icon(Icons.copy_all_outlined),
                         ),
                       ],
                     ),
@@ -1785,7 +1790,7 @@ class _MarkdownEditorState extends State<_MarkdownEditor> {
                       icon: const Icon(Icons.keyboard_arrow_down),
                     ),
                     IconButton(
-                      onPressed: () => setState(() => _showSearch = false),
+                      onPressed: _closeSearch,
                       tooltip: '关闭查找',
                       iconSize: 18,
                       icon: const Icon(Icons.close),
@@ -1829,28 +1834,32 @@ class _MarkdownEditorState extends State<_MarkdownEditor> {
                     ),
                     child: ScrollConfiguration(
                       behavior: const _EditorScrollBehavior(),
-                      child: TextField(
-                        controller: _controller,
-                        focusNode: _focusNode,
-                        undoController: _undoController,
-                        scrollController: _scrollController,
-                        expands: true,
-                        maxLines: null,
-                        minLines: null,
-                        keyboardType: TextInputType.multiline,
-                        textAlignVertical: TextAlignVertical.top,
-                        style: const TextStyle(
-                          fontFamily: 'Consolas',
-                          fontFamilyFallback: ['Menlo', 'monospace'],
-                          fontSize: 14,
-                          height: 1.55,
-                          letterSpacing: 0,
+                      child: Listener(
+                        behavior: HitTestBehavior.translucent,
+                        onPointerDown: (_) => _focusNode.requestFocus(),
+                        child: TextField(
+                          controller: _controller,
+                          focusNode: _focusNode,
+                          undoController: _undoController,
+                          scrollController: _scrollController,
+                          expands: true,
+                          maxLines: null,
+                          minLines: null,
+                          keyboardType: TextInputType.multiline,
+                          textAlignVertical: TextAlignVertical.top,
+                          style: const TextStyle(
+                            fontFamily: 'Consolas',
+                            fontFamilyFallback: ['Menlo', 'monospace'],
+                            fontSize: 14,
+                            height: 1.55,
+                            letterSpacing: 0,
+                          ),
+                          decoration: const InputDecoration(
+                            border: InputBorder.none,
+                            contentPadding: EdgeInsets.all(18),
+                          ),
+                          onChanged: widget.onChanged,
                         ),
-                        decoration: const InputDecoration(
-                          border: InputBorder.none,
-                          contentPadding: EdgeInsets.all(18),
-                        ),
-                        onChanged: widget.onChanged,
                       ),
                     ),
                   ),
@@ -1878,6 +1887,27 @@ class _MarkdownEditorState extends State<_MarkdownEditor> {
       extentOffset: index + query.length,
     );
     _focusNode.requestFocus();
+  }
+
+  void _undo() {
+    _undoController.undo();
+    _focusNode.requestFocus();
+  }
+
+  void _redo() {
+    _undoController.redo();
+    _focusNode.requestFocus();
+  }
+
+  Future<void> _copyAll() async {
+    await Clipboard.setData(ClipboardData(text: _controller.text));
+  }
+
+  void _closeSearch() {
+    setState(() => _showSearch = false);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
   }
 }
 

@@ -7,6 +7,7 @@ import 'package:any2md_desktop/features/workspace/workspace_page.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -18,12 +19,18 @@ class TestWorkspaceController extends WorkspaceController {
 
   final WorkspaceState initialState;
   Set<String>? confirmedSheetNames;
+  String? editedMarkdown;
 
   @override
   WorkspaceState build() => initialState;
 
   @override
   Future<void> initialize() async {}
+
+  @override
+  void editMarkdown(String taskId, String markdown) {
+    editedMarkdown = markdown;
+  }
 
   @override
   Future<void> updateSheetSelection(
@@ -111,6 +118,93 @@ void main() {
     expect(find.text('编辑'), findsOneWidget);
     expect(find.text('预览'), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
+  });
+
+  testWidgets('copies all markdown from the editor toolbar', (tester) async {
+    const markdown = '# Report\n\nComplete document body.\n';
+    final task = ConversionTask(
+      id: 'copy-task',
+      sourcePath: r'C:\docs\copy.docx',
+      displayName: 'copy.docx',
+      inputType: 'docx',
+      status: ConversionStatus.ready,
+      createdAt: DateTime(2026, 7, 23),
+      markdown: markdown,
+    );
+    String? clipboardText;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          clipboardText =
+              (call.arguments as Map<Object?, Object?>)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(
+      testApp(
+        WorkspaceState(
+          tasks: [task],
+          selectedTaskId: task.id,
+          initialized: true,
+        ),
+      ),
+    );
+    await tester.tap(find.byTooltip('复制全部 Markdown'));
+    await tester.pump();
+
+    expect(clipboardText, markdown);
+  });
+
+  testWidgets('focuses the editor after leaving preview and accepts input', (
+    tester,
+  ) async {
+    final task = ConversionTask(
+      id: 'focus-task',
+      sourcePath: r'C:\docs\focus.docx',
+      displayName: 'focus.docx',
+      inputType: 'docx',
+      status: ConversionStatus.ready,
+      createdAt: DateTime(2026, 7, 27),
+      markdown: '# Original',
+      isDirty: true,
+    );
+    final controller = TestWorkspaceController(
+      WorkspaceState(tasks: [task], selectedTaskId: task.id, initialized: true),
+    );
+    await tester.pumpWidget(
+      testApp(controller.initialState, controller: controller),
+    );
+
+    await tester.tap(find.text('预览'));
+    await tester.pump();
+    await tester.tap(find.text('编辑'));
+    await tester.pumpAndSettle();
+
+    final editorFinder = find.byWidgetPredicate(
+      (widget) => widget is TextField && widget.expands,
+    );
+    final editableText = tester.widget<EditableText>(
+      find.descendant(of: editorFinder, matching: find.byType(EditableText)),
+    );
+    expect(editableText.focusNode.hasPrimaryFocus, isTrue);
+
+    tester.testTextInput.enterText('# Updated');
+    await tester.pump();
+
+    expect(
+      tester.widget<TextField>(editorFinder).controller!.text,
+      '# Updated',
+    );
+    expect(controller.editedMarkdown, '# Updated');
   });
 
   testWidgets('allows the task sidebar to shrink to 180 pixels', (
