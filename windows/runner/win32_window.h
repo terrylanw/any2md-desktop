@@ -12,6 +12,10 @@
 // rendering and input handling
 class Win32Window {
  public:
+  // Use an application-specific class so another Flutter app cannot be activated.
+  static constexpr wchar_t kWindowClassName[] = L"ANY2MD_RUNNER_WIN32_WINDOW";
+  static UINT GetActivationMessage();
+
   struct Point {
     unsigned int x;
     unsigned int y;

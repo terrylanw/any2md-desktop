@@ -9,6 +9,7 @@ Any2MD 是一个面向 Windows 和 macOS 的本地办公文档转 Markdown 工�
 - Markdown 轻量编辑、查找、撤销重做和安全预览
 - UTF-8 导出、未导出草稿恢复、浅色/深色/系统主题
 - worker 超时和崩溃恢复，不要求最终用户安装 Python
+- Windows 单实例运行：重复点击快捷方式会唤起已有窗口，包括最小化或隐藏到托盘的窗口
 
 首版不支持 OCR、旧版 `.doc/.xls/.ppt`、RTF、ODF 和 Office 内嵌图片提取。
 

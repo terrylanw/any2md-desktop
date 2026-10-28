@@ -16,8 +16,6 @@ namespace {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
-
 /// Registry key for app theme preference.
 ///
 /// A value of 0 indicates apps should use dark mode. A non-zero or missing
@@ -90,7 +88,7 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
   if (!class_registered_) {
     WNDCLASS window_class{};
     window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    window_class.lpszClassName = kWindowClassName;
+    window_class.lpszClassName = Win32Window::kWindowClassName;
     window_class.style = CS_HREDRAW | CS_VREDRAW;
     window_class.cbClsExtra = 0;
     window_class.cbWndExtra = 0;
@@ -103,11 +101,11 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     RegisterClass(&window_class);
     class_registered_ = true;
   }
-  return kWindowClassName;
+  return Win32Window::kWindowClassName;
 }
 
 void WindowClassRegistrar::UnregisterWindowClass() {
-  UnregisterClass(kWindowClassName, nullptr);
+  UnregisterClass(Win32Window::kWindowClassName, nullptr);
   class_registered_ = false;
 }
 
@@ -118,6 +116,12 @@ Win32Window::Win32Window() {
 Win32Window::~Win32Window() {
   --g_active_window_count;
   Destroy();
+}
+
+UINT Win32Window::GetActivationMessage() {
+  static const UINT message =
+      RegisterWindowMessage(L"Any2MD.Desktop.Activate");
+  return message;
 }
 
 bool Win32Window::Create(const std::wstring& title,
@@ -178,6 +182,14 @@ Win32Window::MessageHandler(HWND hwnd,
                             UINT const message,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
+  if (message != 0 && message == GetActivationMessage()) {
+    // SW_SHOW preserves a maximized window; SW_RESTORE also handles a minimized
+    // window that was subsequently hidden in the notification area.
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(hwnd);
+    return 0;
+  }
+
   switch (message) {
     case WM_NCLBUTTONDOWN:
     case WM_NCLBUTTONUP:
