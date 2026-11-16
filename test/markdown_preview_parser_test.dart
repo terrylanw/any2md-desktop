@@ -38,6 +38,59 @@ final value = 1;
     );
   });
 
+  test('keeps generated HTML line breaks inside GFM table cells', () async {
+    final parsed = await MarkdownPreviewParser().parse(
+      taskId: 'pasted-table',
+      revision: 1,
+      enableTableLineBreaks: true,
+      source:
+          '| English | العربية |\n| --- | --- |\n| first<br>second | مرحبا |',
+    );
+
+    final elements = _allElements(parsed.nodes).toList();
+    expect(
+      elements.map((element) => element.tag),
+      containsAll(['table', 'br']),
+    );
+    expect(parsed.source, contains('first<br>second'));
+    expect(parsed.enableTableLineBreaks, isTrue);
+  });
+
+  test(
+    'keeps table line-break syntax out of ordinary preview cache entries',
+    () async {
+      final parser = MarkdownPreviewParser();
+      final ordinary = await parser.parse(
+        taskId: 'same-task',
+        revision: 1,
+        source: '| A |\n| --- |\n| literal\\<br\\>text |',
+      );
+      final table = await parser.parse(
+        taskId: 'same-task',
+        revision: 1,
+        enableTableLineBreaks: true,
+        source: '| A |\n| --- |\n| first<br>second |',
+      );
+
+      expect(ordinary.key.enableTableLineBreaks, isFalse);
+      expect(table.key.enableTableLineBreaks, isTrue);
+      expect(
+        _allElements(ordinary.nodes).map((element) => element.tag),
+        isNot(contains('br')),
+      );
+      expect(
+        _allElements(
+          ordinary.nodes,
+        ).singleWhere((element) => element.tag == 'td').textContent,
+        'literal<br>text',
+      );
+      expect(
+        _allElements(table.nodes).map((element) => element.tag),
+        contains('br'),
+      );
+    },
+  );
+
   test('reuses the same revision and invalidates changed source', () async {
     final parser = MarkdownPreviewParser();
     final first = await parser.parse(

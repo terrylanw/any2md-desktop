@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
@@ -13,6 +14,7 @@ import '../../services/app_logger.dart';
 import '../../services/draft_store.dart';
 import '../../services/export_service.dart';
 import '../../services/settings_service.dart';
+import 'tsv_table_converter.dart';
 
 final converterClientProvider = Provider<ConverterClient>((ref) {
   final logger = ref.read(appLoggerProvider);
@@ -48,6 +50,14 @@ class AddFilesResult {
   final List<String> unsupported;
 }
 
+enum PastedTableRenameResult {
+  renamed,
+  taskNotFound,
+  emptyName,
+  reservedName,
+  duplicateName,
+}
+
 class WorkspaceController extends Notifier<WorkspaceState> {
   static const _uuid = Uuid();
   final _draftTimers = <String, Timer>{};
@@ -76,9 +86,31 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       final results = await Future.wait<Object>([
         ref.read(draftStoreProvider).loadAll(),
         ref.read(settingsServiceProvider).loadTheme(),
+        ref.read(settingsServiceProvider).loadNextPastedTableNumber(),
       ]);
-      final drafts = results[0] as List<ConversionTask>;
+      final loadedDrafts = results[0] as List<ConversionTask>;
       final theme = results[1] as AppThemePreference;
+      final nextTableNumber = results[2] as int;
+      final drafts = [...loadedDrafts]
+        ..sort((a, b) {
+          final dateComparison = a.createdAt.compareTo(b.createdAt);
+          return dateComparison != 0 ? dateComparison : a.id.compareTo(b.id);
+        });
+      final migratedDrafts = <ConversionTask>[];
+      var nextAvailableTableNumber = math.max(
+        nextTableNumber,
+        _highestPastedTableNumber(drafts) + 1,
+      );
+      for (var index = 0; index < drafts.length; index++) {
+        final task = drafts[index];
+        if (!task.isPastedTable || task.displayName != '粘贴表格') continue;
+        final migrated = task.copyWith(
+          displayName: '粘贴表格 $nextAvailableTableNumber',
+        );
+        drafts[index] = migrated;
+        migratedDrafts.add(migrated);
+        nextAvailableTableNumber++;
+      }
       state = state.copyWith(
         tasks: drafts,
         selectedTaskId: drafts.isEmpty ? null : drafts.first.id,
@@ -86,10 +118,17 @@ class WorkspaceController extends Notifier<WorkspaceState> {
         themePreference: theme,
         initialized: true,
       );
+      await Future.wait(
+        migratedDrafts.map((task) => ref.read(draftStoreProvider).save(task)),
+      );
+      await ref
+          .read(settingsServiceProvider)
+          .advanceNextPastedTableNumber(nextAvailableTableNumber);
       if (drafts.any(
         (task) =>
-            task.status == ConversionStatus.inspectionQueued ||
-            task.status == ConversionStatus.queued,
+            !task.isPastedTable &&
+            (task.status == ConversionStatus.inspectionQueued ||
+                task.status == ConversionStatus.queued),
       )) {
         unawaited(_drainQueue());
       }
@@ -103,7 +142,8 @@ class WorkspaceController extends Notifier<WorkspaceState> {
   Future<AddFilesResult> addPaths(Iterable<String> filePaths) async {
     final paths = filePaths.toList(growable: false);
     final existing = state.tasks
-        .map((task) => _comparisonPath(task.sourcePath))
+        .where((task) => task.sourcePath != null)
+        .map((task) => _comparisonPath(task.sourcePath!))
         .toSet();
     final added = <ConversionTask>[];
     final unsupported = <String>[];
@@ -171,8 +211,9 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       final rawPath = paths.first;
       final match = state.tasks.where(
         (task) =>
-            _comparisonPath(task.sourcePath) ==
-            _comparisonPath(path.normalize(path.absolute(rawPath))),
+            task.sourcePath != null &&
+            _comparisonPath(task.sourcePath!) ==
+                _comparisonPath(path.normalize(path.absolute(rawPath))),
       );
       if (match.isNotEmpty) selectTask(match.first.id);
     }
@@ -187,6 +228,156 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     if (state.tasks.any((task) => task.id == id)) {
       state = state.copyWith(selectedTaskId: id);
     }
+  }
+
+  Future<ConversionTask> createPastedTable(
+    String sourceText, {
+    required bool firstRowIsHeader,
+    TsvTable? parsedTable,
+  }) async {
+    final markdown = await TsvTableConverter.generateMarkdown(
+      sourceText,
+      firstRowIsHeader: firstRowIsHeader,
+      parsedTable: parsedTable,
+    );
+    final nextMinimum = _highestPastedTableNumber(state.tasks) + 1;
+    final tableNumber = await ref
+        .read(settingsServiceProvider)
+        .reserveNextPastedTableNumber(minimum: nextMinimum);
+    final task = ConversionTask(
+      id: _uuid.v4(),
+      sourceKind: TaskSourceKind.pastedTable,
+      sourcePath: null,
+      sourceText: sourceText,
+      firstRowIsHeader: firstRowIsHeader,
+      generatedMarkdown: markdown,
+      displayName: '粘贴表格 $tableNumber',
+      inputType: 'tsv',
+      status: ConversionStatus.ready,
+      createdAt: DateTime.now(),
+      markdown: markdown,
+      isDirty: true,
+    );
+    state = state.copyWith(
+      tasks: [...state.tasks, task],
+      selectedTaskId: task.id,
+    );
+    await ref.read(draftStoreProvider).save(task);
+    return task;
+  }
+
+  Future<PastedTableRenameResult> renamePastedTable(
+    String taskId,
+    String name,
+  ) async {
+    final normalizedName = name.trim();
+    var task = _taskById(taskId);
+    if (task == null || !task.isPastedTable) {
+      return PastedTableRenameResult.taskNotFound;
+    }
+    final initialResult = _validatePastedTableName(taskId, normalizedName);
+    if (initialResult != PastedTableRenameResult.renamed) return initialResult;
+
+    await flushMarkdown(taskId);
+    task = _taskById(taskId);
+    if (task == null || !task.isPastedTable) {
+      return PastedTableRenameResult.taskNotFound;
+    }
+    final result = _validatePastedTableName(taskId, normalizedName);
+    if (result != PastedTableRenameResult.renamed) return result;
+
+    final sequence = _pastedTableNumberFromName(normalizedName);
+    if (sequence != null) {
+      await ref
+          .read(settingsServiceProvider)
+          .advanceNextPastedTableNumber(sequence + 1);
+      task = _taskById(taskId);
+      if (task == null || !task.isPastedTable) {
+        return PastedTableRenameResult.taskNotFound;
+      }
+      final latestResult = _validatePastedTableName(taskId, normalizedName);
+      if (latestResult != PastedTableRenameResult.renamed) return latestResult;
+    }
+
+    final renamed = task.copyWith(displayName: normalizedName);
+    _replaceTask(renamed);
+    await ref.read(draftStoreProvider).save(renamed);
+    return PastedTableRenameResult.renamed;
+  }
+
+  PastedTableRenameResult _validatePastedTableName(String taskId, String name) {
+    if (name.isEmpty) return PastedTableRenameResult.emptyName;
+    if (name == '粘贴表格') return PastedTableRenameResult.reservedName;
+    final normalized = name.toLowerCase();
+    if (state.tasks.any(
+      (task) =>
+          task.id != taskId &&
+          task.isPastedTable &&
+          task.displayName.trim().toLowerCase() == normalized,
+    )) {
+      return PastedTableRenameResult.duplicateName;
+    }
+    return PastedTableRenameResult.renamed;
+  }
+
+  static int _highestPastedTableNumber(Iterable<ConversionTask> tasks) {
+    var highest = 0;
+    for (final task in tasks) {
+      if (!task.isPastedTable) continue;
+      final number = _pastedTableNumberFromName(task.displayName);
+      if (number != null) highest = math.max(highest, number);
+    }
+    return highest;
+  }
+
+  static int? _pastedTableNumberFromName(String name) {
+    final match = RegExp(r'^粘贴表格 ([1-9]\d*)$').firstMatch(name);
+    return match == null ? null : int.tryParse(match.group(1)!);
+  }
+
+  /// Returns false without changing the task when edited Markdown needs
+  /// confirmation before the new source is applied.
+  Future<bool> updatePastedTable({
+    required String taskId,
+    required String sourceText,
+    required bool firstRowIsHeader,
+    bool confirmOverwrite = false,
+    TsvTable? parsedTable,
+  }) async {
+    await flushMarkdown(taskId);
+    var task = _taskById(taskId);
+    if (task == null || !task.isPastedTable) return false;
+    if (task.markdown != task.generatedMarkdown && !confirmOverwrite) {
+      return false;
+    }
+    final startingRevision = task.revision;
+    final markdown = await TsvTableConverter.generateMarkdown(
+      sourceText,
+      firstRowIsHeader: firstRowIsHeader,
+      parsedTable: parsedTable,
+    );
+    await flushMarkdown(taskId);
+    task = _taskById(taskId);
+    // A newer edit or regeneration must win over this asynchronous result.
+    if (task == null ||
+        !task.isPastedTable ||
+        task.revision != startingRevision) {
+      return false;
+    }
+    final updated = task.copyWith(
+      sourceText: sourceText,
+      firstRowIsHeader: firstRowIsHeader,
+      markdown: markdown,
+      generatedMarkdown: markdown,
+      isDirty: true,
+      hasManualEdits: false,
+      clearExportedPath: true,
+      clearError: true,
+      revision: task.revision + 1,
+    );
+    _replaceTask(updated);
+    await ref.read(draftStoreProvider).save(updated);
+    return true;
   }
 
   void editMarkdown(String taskId, String markdown) {
@@ -269,7 +460,11 @@ class WorkspaceController extends Notifier<WorkspaceState> {
 
   Future<void> retryTask(String id) async {
     final task = _taskById(id);
-    if (task == null || task.status == ConversionStatus.converting) return;
+    if (task == null ||
+        task.isPastedTable ||
+        task.status == ConversionStatus.converting) {
+      return;
+    }
     final needsInspection =
         task.inputType == 'xlsx' &&
         (task.workbookSheets.isEmpty ||
@@ -409,8 +604,9 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       while (!_exiting) {
         final queued = state.tasks.where(
           (task) =>
-              task.status == ConversionStatus.inspectionQueued ||
-              task.status == ConversionStatus.queued,
+              !task.isPastedTable &&
+              (task.status == ConversionStatus.inspectionQueued ||
+                  task.status == ConversionStatus.queued),
         );
         if (queued.isEmpty) break;
         final task = queued.first;
@@ -423,7 +619,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
           final output = await ref
               .read(converterClientProvider)
               .convert(
-                inputPath: task.sourcePath,
+                inputPath: task.sourcePath!,
                 inputType: task.inputType,
                 sheetNames: task.inputType == 'xlsx'
                     ? task.selectedSheetNames
@@ -490,8 +686,9 @@ class WorkspaceController extends Notifier<WorkspaceState> {
       if (!_exiting &&
           state.tasks.any(
             (task) =>
-                task.status == ConversionStatus.inspectionQueued ||
-                task.status == ConversionStatus.queued,
+                !task.isPastedTable &&
+                (task.status == ConversionStatus.inspectionQueued ||
+                    task.status == ConversionStatus.queued),
           )) {
         unawaited(_drainQueue());
       }
@@ -503,7 +700,7 @@ class WorkspaceController extends Notifier<WorkspaceState> {
     try {
       final output = await ref
           .read(converterClientProvider)
-          .inspectWorkbook(inputPath: task.sourcePath);
+          .inspectWorkbook(inputPath: task.sourcePath!);
       final current = _taskById(task.id);
       if (current == null) return;
       final previousSelection = current.selectedSheetNames.toSet();

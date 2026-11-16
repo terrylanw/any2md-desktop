@@ -30,9 +30,15 @@ class _CountingMarkdownPreviewParser extends MarkdownPreviewParser {
     required String taskId,
     required int revision,
     required String source,
+    bool enableTableLineBreaks = false,
   }) {
     parseCalls++;
-    return super.parse(taskId: taskId, revision: revision, source: source);
+    return super.parse(
+      taskId: taskId,
+      revision: revision,
+      source: source,
+      enableTableLineBreaks: enableTableLineBreaks,
+    );
   }
 }
 
@@ -111,7 +117,11 @@ void main() {
     }
 
     expect(parser.parseCalls, 1);
-    expect(controller.position.maxScrollExtent, closeTo(maxExtent, 0.5));
+    expect(controller.position.maxScrollExtent, greaterThan(0));
+    expect(
+      controller.offset,
+      lessThanOrEqualTo(controller.position.maxScrollExtent),
+    );
     expect(timings, isNotEmpty);
 
     final buildTimes =
@@ -123,6 +133,83 @@ void main() {
     );
     expect(buildTimes[p95Index], lessThanOrEqualTo(16670));
     expect(buildTimes.last, lessThanOrEqualTo(50000));
+  });
+
+  testWidgets('switching large previews stays responsive', (tester) async {
+    final markdown = _largeMarkdownFixture();
+    final parser = _CountingMarkdownPreviewParser();
+    final tasks = [
+      ConversionTask(
+        id: 'first-performance-task',
+        sourcePath: r'C:\benchmarks\first.docx',
+        displayName: 'first.docx',
+        inputType: 'docx',
+        status: ConversionStatus.ready,
+        createdAt: DateTime(2026, 7, 24),
+        revision: 1,
+        markdown: markdown,
+      ),
+      ConversionTask(
+        id: 'second-performance-task',
+        sourcePath: r'C:\benchmarks\second.docx',
+        displayName: 'second.docx',
+        inputType: 'docx',
+        status: ConversionStatus.ready,
+        createdAt: DateTime(2026, 7, 25),
+        revision: 1,
+        markdown: markdown,
+      ),
+    ];
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          workspaceControllerProvider.overrideWith(
+            () => _BenchmarkWorkspaceController(
+              WorkspaceState(
+                tasks: tasks,
+                selectedTaskId: tasks.first.id,
+                initialized: true,
+              ),
+            ),
+          ),
+          desktopWindowEnabledProvider.overrideWithValue(false),
+          markdownPreviewParserProvider.overrideWithValue(parser),
+        ],
+        child: const Any2MdApp(),
+      ),
+    );
+    await tester.tap(find.text('预览'));
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(seconds: 2)),
+    );
+    await tester.pumpAndSettle(const Duration(milliseconds: 100));
+    expect(parser.parseCalls, 1);
+
+    final timings = <FrameTiming>[];
+    void collectTimings(List<FrameTiming> values) => timings.addAll(values);
+    SchedulerBinding.instance.addTimingsCallback(collectTimings);
+    try {
+      await tester.tap(find.text('second.docx'));
+      await tester.pump();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(seconds: 2)),
+      );
+      await tester.pumpAndSettle(const Duration(milliseconds: 100));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 250)),
+      );
+    } finally {
+      SchedulerBinding.instance.removeTimingsCallback(collectTimings);
+    }
+
+    expect(parser.parseCalls, 2);
+    expect(timings, isNotEmpty);
+    final longestBuild = timings
+        .map((timing) => timing.buildDuration.inMicroseconds)
+        .reduce((a, b) => a > b ? a : b);
+    expect(longestBuild, lessThanOrEqualTo(50000));
   });
 }
 

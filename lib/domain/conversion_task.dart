@@ -9,6 +9,8 @@ enum ConversionStatus {
   cancelled,
 }
 
+enum TaskSourceKind { file, pastedTable }
+
 enum SheetVisibility { visible, hidden, veryHidden }
 
 class WorkbookSheetInfo {
@@ -72,11 +74,15 @@ class ConversionTask {
 
   const ConversionTask({
     required this.id,
-    required this.sourcePath,
     required this.displayName,
     required this.inputType,
     required this.status,
     required this.createdAt,
+    this.sourcePath,
+    this.sourceKind = TaskSourceKind.file,
+    this.sourceText,
+    this.firstRowIsHeader = true,
+    this.generatedMarkdown,
     this.revision = 0,
     this.markdown = '',
     this.warnings = const [],
@@ -92,7 +98,11 @@ class ConversionTask {
   });
 
   final String id;
-  final String sourcePath;
+  final String? sourcePath;
+  final TaskSourceKind sourceKind;
+  final String? sourceText;
+  final bool firstRowIsHeader;
+  final String? generatedMarkdown;
   final String displayName;
   final String inputType;
   final ConversionStatus status;
@@ -110,7 +120,16 @@ class ConversionTask {
   final bool hasManualEdits;
   final int workbookInspectionVersion;
 
+  bool get isPastedTable => sourceKind == TaskSourceKind.pastedTable;
+
   ConversionTask copyWith({
+    String? sourcePath,
+    bool clearSourcePath = false,
+    TaskSourceKind? sourceKind,
+    String? sourceText,
+    bool? firstRowIsHeader,
+    String? generatedMarkdown,
+    String? displayName,
     ConversionStatus? status,
     String? markdown,
     List<String>? warnings,
@@ -131,8 +150,12 @@ class ConversionTask {
   }) {
     return ConversionTask(
       id: id,
-      sourcePath: sourcePath,
-      displayName: displayName,
+      sourcePath: clearSourcePath ? null : sourcePath ?? this.sourcePath,
+      sourceKind: sourceKind ?? this.sourceKind,
+      sourceText: sourceText ?? this.sourceText,
+      firstRowIsHeader: firstRowIsHeader ?? this.firstRowIsHeader,
+      generatedMarkdown: generatedMarkdown ?? this.generatedMarkdown,
+      displayName: displayName ?? this.displayName,
       inputType: inputType,
       status: status ?? this.status,
       createdAt: createdAt,
@@ -163,6 +186,10 @@ class ConversionTask {
   Map<String, Object?> toJson() => {
     'id': id,
     'sourcePath': sourcePath,
+    'sourceKind': sourceKind.name,
+    'sourceText': sourceText,
+    'firstRowIsHeader': firstRowIsHeader,
+    'generatedMarkdown': generatedMarkdown,
     'displayName': displayName,
     'inputType': inputType,
     'status': status.name,
@@ -183,6 +210,11 @@ class ConversionTask {
 
   factory ConversionTask.fromJson(Map<String, Object?> json) {
     final inputType = json['inputType']! as String;
+    final sourceKindName = json['sourceKind'] as String? ?? 'file';
+    final sourceKind = TaskSourceKind.values.firstWhere(
+      (value) => value.name == sourceKindName,
+      orElse: () => TaskSourceKind.file,
+    );
     final sheets = (json['workbookSheets'] as List<Object?>? ?? const [])
         .whereType<Map>()
         .map(
@@ -196,7 +228,13 @@ class ConversionTask {
       (value) => value.name == persistedStatusName,
       orElse: () => ConversionStatus.ready,
     );
-    if (status == ConversionStatus.inspecting) {
+    if (sourceKind == TaskSourceKind.pastedTable &&
+        (status == ConversionStatus.inspecting ||
+            status == ConversionStatus.converting ||
+            status == ConversionStatus.queued ||
+            status == ConversionStatus.inspectionQueued)) {
+      status = ConversionStatus.ready;
+    } else if (status == ConversionStatus.inspecting) {
       status = ConversionStatus.inspectionQueued;
     } else if (status == ConversionStatus.converting) {
       status = inputType == 'xlsx' && sheets.isEmpty
@@ -213,7 +251,11 @@ class ConversionTask {
     }
     return ConversionTask(
       id: json['id']! as String,
-      sourcePath: json['sourcePath']! as String,
+      sourcePath: json['sourcePath'] as String?,
+      sourceKind: sourceKind,
+      sourceText: json['sourceText'] as String?,
+      firstRowIsHeader: json['firstRowIsHeader'] as bool? ?? true,
+      generatedMarkdown: json['generatedMarkdown'] as String?,
       displayName: json['displayName']! as String,
       inputType: inputType,
       status: status,

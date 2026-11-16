@@ -6,12 +6,14 @@ import '../domain/workspace_state.dart';
 
 class SettingsService {
   static const _themeKey = 'theme_preference';
+  static const _nextPastedTableNumberKey = 'next_pasted_table_number';
   static const _sidebarWidthKey = 'sidebar_width';
   static const _windowXKey = 'window_x';
   static const _windowYKey = 'window_y';
   static const _windowWidthKey = 'window_width';
   static const _windowHeightKey = 'window_height';
   Future<SharedPreferences>? _preferencesFuture;
+  Future<void> _pastedTableNumberQueue = Future<void>.value();
 
   Future<SharedPreferences> _preferences() {
     return _preferencesFuture ??= SharedPreferences.getInstance();
@@ -29,6 +31,43 @@ class SettingsService {
   Future<void> saveTheme(AppThemePreference value) async {
     final preferences = await _preferences();
     await preferences.setString(_themeKey, value.name);
+  }
+
+  Future<int> loadNextPastedTableNumber() async {
+    final preferences = await _preferences();
+    final next = preferences.getInt(_nextPastedTableNumberKey) ?? 1;
+    return next < 1 ? 1 : next;
+  }
+
+  Future<int> reserveNextPastedTableNumber({int minimum = 1}) {
+    return _queuePastedTableNumberOperation(() async {
+      final preferences = await _preferences();
+      final stored = preferences.getInt(_nextPastedTableNumberKey) ?? 1;
+      final number = stored < minimum ? minimum : stored;
+      await preferences.setInt(_nextPastedTableNumberKey, number + 1);
+      return number;
+    });
+  }
+
+  Future<void> advanceNextPastedTableNumber(int minimum) {
+    return _queuePastedTableNumberOperation(() async {
+      final preferences = await _preferences();
+      final stored = preferences.getInt(_nextPastedTableNumberKey) ?? 1;
+      if (stored < minimum) {
+        await preferences.setInt(_nextPastedTableNumberKey, minimum);
+      }
+    });
+  }
+
+  Future<T> _queuePastedTableNumberOperation<T>(
+    Future<T> Function() operation,
+  ) {
+    final result = _pastedTableNumberQueue.then((_) => operation());
+    _pastedTableNumberQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
   }
 
   Future<double> loadSidebarWidth() async {

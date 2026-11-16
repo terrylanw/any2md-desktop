@@ -10,6 +10,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:markdown/markdown.dart' as md;
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:path/path.dart' as path;
 import 'package:window_manager/window_manager.dart';
@@ -19,7 +20,10 @@ import '../../domain/conversion_task.dart';
 import '../../domain/workspace_state.dart';
 import '../../services/settings_service.dart';
 import '../../services/windows_tray_service.dart';
+import '../about/about_dialog.dart';
 import 'markdown_preview_parser.dart';
+import 'table_input_dialog.dart';
+import 'tsv_table_converter.dart';
 import 'workspace_controller.dart';
 
 enum EditorMode { edit, preview }
@@ -41,6 +45,8 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
   static const _sidebarMaxWidth = 400.0;
 
   final _splitController = MultiSplitViewController();
+  final _aboutFocusNode = FocusNode(debugLabel: 'about-button');
+  bool _aboutDialogOpen = false;
   bool _dragging = false;
   late final bool _windowEnabled;
   late final bool _trayEnabled;
@@ -105,6 +111,7 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
     }
     _trayService?.dispose();
     _splitController.dispose();
+    _aboutFocusNode.dispose();
     _windowSaveTimer?.cancel();
     _sidebarSaveTimer?.cancel();
     super.dispose();
@@ -172,6 +179,20 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
     });
   }
 
+  Future<void> _showAbout() async {
+    if (_aboutDialogOpen) return;
+    _aboutDialogOpen = true;
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (context) => const AppAboutDialog(),
+      );
+    } finally {
+      _aboutDialogOpen = false;
+      if (mounted) _aboutFocusNode.requestFocus();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final initialized = ref.watch(
@@ -192,9 +213,12 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
                 children: [
                   _ToolbarConsumer(
                     onAddFiles: _pickFiles,
+                    onPasteTable: _createPastedTable,
                     onCancel: _cancelSelected,
                     onExport: _exportSelected,
                     onOpenLogs: _openLogs,
+                    onAbout: _showAbout,
+                    aboutFocusNode: _aboutFocusNode,
                     onThemeChanged: (theme) => ref
                         .read(workspaceControllerProvider.notifier)
                         .setTheme(theme),
@@ -212,10 +236,9 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
                             },
                             builder: (context, area) => area.index == 0
                                 ? _TaskSidebarConsumer(
-                                    onSelect: (id) {
-                                      unawaited(_selectTaskAfterFlush(id));
-                                    },
+                                    onSelect: _selectTask,
                                     onRemove: _removeTask,
+                                    onRename: _renamePastedTable,
                                   )
                                 : _DocumentWorkspaceConsumer(
                                     onMarkdownChanged: (id, markdown) => ref
@@ -243,6 +266,7 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
                                           workspaceControllerProvider.notifier,
                                         )
                                         .confirmSheetSelection(id, names),
+                                    onEditTableSource: _editPastedTableSource,
                                   ),
                           )
                         : const Center(child: CircularProgressIndicator()),
@@ -265,9 +289,9 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
     });
   }
 
-  Future<void> _selectTaskAfterFlush(String id) async {
+  void _selectTask(String id) {
     final controller = ref.read(workspaceControllerProvider.notifier);
-    await controller.flushAllMarkdown();
+    unawaited(controller.flushAllMarkdown());
     controller.selectTask(id);
   }
 
@@ -281,6 +305,86 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
       ],
     );
     await _addPaths(files.map((file) => file.path));
+  }
+
+  Future<void> _createPastedTable() async {
+    final input = await showTsvTableInputDialog(context);
+    if (input == null || !mounted) return;
+    try {
+      await ref
+          .read(workspaceControllerProvider.notifier)
+          .createPastedTable(
+            input.text,
+            firstRowIsHeader: input.firstRowIsHeader,
+            parsedTable: input.table,
+          );
+      if (mounted) _showMessage('Markdown 表格已添加到任务列表');
+    } on TsvTableFormatException catch (error) {
+      if (mounted) _showMessage(error.toString());
+    } on Object catch (error) {
+      if (mounted) _showMessage('创建表格失败：$error');
+    }
+  }
+
+  Future<void> _editPastedTableSource(ConversionTask originalTask) async {
+    final controller = ref.read(workspaceControllerProvider.notifier);
+    await controller.flushMarkdown(originalTask.id);
+    final task = ref
+        .read(workspaceControllerProvider)
+        .tasks
+        .where((task) => task.id == originalTask.id && task.isPastedTable)
+        .firstOrNull;
+    if (task == null || !mounted) return;
+
+    final input = await showTsvTableInputDialog(
+      context,
+      initialText: task.sourceText ?? '',
+      firstRowIsHeader: task.firstRowIsHeader,
+      isEditing: true,
+    );
+    if (input == null || !mounted) return;
+    try {
+      final saved = await controller.updatePastedTable(
+        taskId: task.id,
+        sourceText: input.text,
+        firstRowIsHeader: input.firstRowIsHeader,
+        parsedTable: input.table,
+      );
+      if (saved) {
+        if (mounted) _showMessage('表格 Markdown 已重新生成');
+        return;
+      }
+      final currentTask = ref
+          .read(workspaceControllerProvider)
+          .tasks
+          .where((item) => item.id == task.id && item.isPastedTable)
+          .firstOrNull;
+      if (currentTask == null ||
+          currentTask.markdown == currentTask.generatedMarkdown) {
+        return;
+      }
+
+      final overwrite = await _confirm(
+        title: '覆盖手动编辑？',
+        message: '当前 Markdown 与上次生成结果不同，重新生成会覆盖手动编辑内容。',
+        confirmLabel: '覆盖并重新生成',
+      );
+      if (!mounted || !overwrite) return;
+      final savedAfterConfirmation = await controller.updatePastedTable(
+        taskId: task.id,
+        sourceText: input.text,
+        firstRowIsHeader: input.firstRowIsHeader,
+        confirmOverwrite: true,
+        parsedTable: input.table,
+      );
+      if (savedAfterConfirmation && mounted) {
+        _showMessage('表格 Markdown 已重新生成');
+      }
+    } on TsvTableFormatException catch (error) {
+      if (mounted) _showMessage(error.toString());
+    } on Object catch (error) {
+      if (mounted) _showMessage('更新表格失败：$error');
+    }
   }
 
   Future<void> _addPaths(Iterable<String> paths) async {
@@ -354,6 +458,23 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
     await ref.read(workspaceControllerProvider.notifier).removeTask(id);
   }
 
+  Future<void> _renamePastedTable(String id) async {
+    final task = ref
+        .read(workspaceControllerProvider)
+        .tasks
+        .where((item) => item.id == id && item.isPastedTable)
+        .firstOrNull;
+    if (task == null) return;
+    final controller = ref.read(workspaceControllerProvider.notifier);
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _RenamePastedTableDialog(
+        initialName: task.displayName,
+        onRename: (name) => controller.renamePastedTable(id, name),
+      ),
+    );
+  }
+
   Future<bool> _confirm({
     required String title,
     required String message,
@@ -389,16 +510,22 @@ class _WorkspacePageState extends ConsumerState<WorkspacePage>
 class _ToolbarConsumer extends ConsumerWidget {
   const _ToolbarConsumer({
     required this.onAddFiles,
+    required this.onPasteTable,
     required this.onCancel,
     required this.onExport,
     required this.onOpenLogs,
+    required this.onAbout,
+    required this.aboutFocusNode,
     required this.onThemeChanged,
   });
 
   final VoidCallback onAddFiles;
+  final VoidCallback onPasteTable;
   final VoidCallback onCancel;
   final VoidCallback onExport;
   final VoidCallback onOpenLogs;
+  final VoidCallback onAbout;
+  final FocusNode aboutFocusNode;
   final ValueChanged<AppThemePreference> onThemeChanged;
 
   @override
@@ -413,24 +540,37 @@ class _ToolbarConsumer extends ConsumerWidget {
       selectedTask: selection.selectedTask,
       themePreference: selection.theme,
       onAddFiles: onAddFiles,
+      onPasteTable: onPasteTable,
       onCancel: onCancel,
       onExport: onExport,
       onOpenLogs: onOpenLogs,
+      onAbout: onAbout,
+      aboutFocusNode: aboutFocusNode,
       onThemeChanged: onThemeChanged,
     );
   }
 }
 
 class _TaskSidebarConsumer extends ConsumerWidget {
-  const _TaskSidebarConsumer({required this.onSelect, required this.onRemove});
+  const _TaskSidebarConsumer({
+    required this.onSelect,
+    required this.onRemove,
+    required this.onRename,
+  });
 
   final ValueChanged<String> onSelect;
   final ValueChanged<String> onRemove;
+  final ValueChanged<String> onRename;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(workspaceControllerProvider);
-    return _TaskSidebar(state: state, onSelect: onSelect, onRemove: onRemove);
+    return _TaskSidebar(
+      state: state,
+      onSelect: onSelect,
+      onRemove: onRemove,
+      onRename: onRename,
+    );
   }
 }
 
@@ -441,6 +581,7 @@ class _DocumentWorkspaceConsumer extends ConsumerWidget {
     required this.onRetry,
     required this.onSheetSelectionChanged,
     required this.onConfirmSheetSelection,
+    required this.onEditTableSource,
   });
 
   final void Function(String id, String markdown) onMarkdownChanged;
@@ -450,6 +591,7 @@ class _DocumentWorkspaceConsumer extends ConsumerWidget {
   onSheetSelectionChanged;
   final Future<void> Function(String id, Iterable<String> names)
   onConfirmSheetSelection;
+  final ValueChanged<ConversionTask> onEditTableSource;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -463,6 +605,7 @@ class _DocumentWorkspaceConsumer extends ConsumerWidget {
       onRetry: onRetry,
       onSheetSelectionChanged: onSheetSelectionChanged,
       onConfirmSheetSelection: onConfirmSheetSelection,
+      onEditTableSource: onEditTableSource,
     );
   }
 }
@@ -498,18 +641,24 @@ class _Toolbar extends StatelessWidget {
     required this.selectedTask,
     required this.themePreference,
     required this.onAddFiles,
+    required this.onPasteTable,
     required this.onCancel,
     required this.onExport,
     required this.onOpenLogs,
+    required this.onAbout,
+    required this.aboutFocusNode,
     required this.onThemeChanged,
   });
 
   final ConversionTask? selectedTask;
   final AppThemePreference themePreference;
   final VoidCallback onAddFiles;
+  final VoidCallback onPasteTable;
   final VoidCallback onCancel;
   final VoidCallback onExport;
   final VoidCallback onOpenLogs;
+  final VoidCallback onAbout;
+  final FocusNode aboutFocusNode;
   final ValueChanged<AppThemePreference> onThemeChanged;
 
   @override
@@ -529,6 +678,12 @@ class _Toolbar extends StatelessWidget {
               onPressed: onAddFiles,
               icon: const Icon(Icons.add, size: 18),
               label: const Text('添加文件'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: onPasteTable,
+              icon: const Icon(Icons.table_chart_outlined, size: 18),
+              label: const Text('粘贴表格'),
             ),
             const SizedBox(width: 8),
             IconButton(
@@ -567,6 +722,16 @@ class _Toolbar extends StatelessWidget {
                 ),
               ],
             ),
+            Tooltip(
+              message: '关于 Any2MD',
+              excludeFromSemantics: true,
+              child: TextButton.icon(
+                onPressed: onAbout,
+                focusNode: aboutFocusNode,
+                icon: const Icon(Icons.info_outline, size: 18),
+                label: const Text('关于', semanticsLabel: '关于 Any2MD'),
+              ),
+            ),
           ],
         ),
       ),
@@ -579,11 +744,13 @@ class _TaskSidebar extends StatelessWidget {
     required this.state,
     required this.onSelect,
     required this.onRemove,
+    required this.onRename,
   });
 
   final WorkspaceState state;
   final ValueChanged<String> onSelect;
   final ValueChanged<String> onRemove;
+  final ValueChanged<String> onRename;
 
   @override
   Widget build(BuildContext context) {
@@ -650,6 +817,23 @@ class _TaskSidebar extends StatelessWidget {
                                     ],
                                   ),
                                 ),
+                                if (task.isPastedTable)
+                                  PopupMenuButton<_PastedTableTaskAction>(
+                                    tooltip: '更多任务操作',
+                                    icon: const Icon(Icons.more_vert),
+                                    onSelected: (action) {
+                                      switch (action) {
+                                        case _PastedTableTaskAction.rename:
+                                          onRename(task.id);
+                                      }
+                                    },
+                                    itemBuilder: (context) => const [
+                                      PopupMenuItem(
+                                        value: _PastedTableTaskAction.rename,
+                                        child: Text('重命名'),
+                                      ),
+                                    ],
+                                  ),
                                 IconButton(
                                   onPressed: () => onRemove(task.id),
                                   tooltip: '移除任务',
@@ -667,6 +851,107 @@ class _TaskSidebar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+enum _PastedTableTaskAction { rename }
+
+class _RenamePastedTableDialog extends StatefulWidget {
+  const _RenamePastedTableDialog({
+    required this.initialName,
+    required this.onRename,
+  });
+
+  final String initialName;
+  final Future<PastedTableRenameResult> Function(String name) onRename;
+
+  @override
+  State<_RenamePastedTableDialog> createState() =>
+      _RenamePastedTableDialogState();
+}
+
+class _RenamePastedTableDialogState extends State<_RenamePastedTableDialog> {
+  late final TextEditingController _nameController;
+  String? _error;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameController = TextEditingController(text: widget.initialName);
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('重命名任务'),
+      content: SizedBox(
+        width: 360,
+        child: TextField(
+          controller: _nameController,
+          autofocus: true,
+          enabled: !_saving,
+          textInputAction: TextInputAction.done,
+          decoration: InputDecoration(labelText: '任务名称', errorText: _error),
+          onChanged: (_) {
+            if (_error != null) setState(() => _error = null);
+          },
+          onSubmitted: (_) => _save(),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _saving ? null : _save,
+          child: _saving
+              ? const SizedBox.square(
+                  dimension: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('保存'),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _save() async {
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      final result = await widget.onRename(_nameController.text);
+      if (!mounted) return;
+      if (result == PastedTableRenameResult.renamed) {
+        Navigator.pop(context);
+        return;
+      }
+      setState(() {
+        _saving = false;
+        _error = switch (result) {
+          PastedTableRenameResult.taskNotFound => '任务不存在或不支持重命名',
+          PastedTableRenameResult.emptyName => '任务名称不能为空',
+          PastedTableRenameResult.reservedName => '请为任务输入一个唯一名称',
+          PastedTableRenameResult.duplicateName => '已有同名粘贴表格任务',
+          PastedTableRenameResult.renamed => null,
+        };
+      });
+    } on Object {
+      if (!mounted) return;
+      setState(() {
+        _saving = false;
+        _error = '保存失败，请重试';
+      });
+    }
   }
 }
 
@@ -698,6 +983,13 @@ class _TaskStatusIcon extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    if (task.isPastedTable) {
+      return Icon(
+        Icons.table_chart_outlined,
+        size: 20,
+        color: task.isDirty ? colors.secondary : colors.primary,
+      );
+    }
     return switch (task.status) {
       ConversionStatus.inspectionQueued => Icon(
         Icons.table_view_outlined,
@@ -749,6 +1041,7 @@ class _DocumentWorkspace extends StatefulWidget {
     required this.onRetry,
     required this.onSheetSelectionChanged,
     required this.onConfirmSheetSelection,
+    required this.onEditTableSource,
   });
 
   final ConversionTask? task;
@@ -759,6 +1052,7 @@ class _DocumentWorkspace extends StatefulWidget {
   onSheetSelectionChanged;
   final Future<void> Function(String id, Iterable<String> names)
   onConfirmSheetSelection;
+  final ValueChanged<ConversionTask> onEditTableSource;
 
   @override
   State<_DocumentWorkspace> createState() => _DocumentWorkspaceState();
@@ -811,6 +1105,9 @@ class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
       children: [
         _DocumentHeader(
           task: task,
+          onEditTableSource: task.isPastedTable
+              ? () => widget.onEditTableSource(task)
+              : null,
           onReselectSheets: task.inputType == 'xlsx'
               ? () => setState(() => _reselectingSheets = true)
               : null,
@@ -854,6 +1151,7 @@ class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
                   taskId: task.id,
                   revision: task.revision,
                   markdown: task.markdown,
+                  isPastedTable: task.isPastedTable,
                 ),
         ),
       ],
@@ -895,10 +1193,15 @@ class _DocumentWorkspaceState extends State<_DocumentWorkspace> {
 }
 
 class _DocumentHeader extends StatelessWidget {
-  const _DocumentHeader({required this.task, this.onReselectSheets});
+  const _DocumentHeader({
+    required this.task,
+    this.onReselectSheets,
+    this.onEditTableSource,
+  });
 
   final ConversionTask task;
   final VoidCallback? onReselectSheets;
+  final VoidCallback? onEditTableSource;
 
   @override
   Widget build(BuildContext context) {
@@ -919,6 +1222,14 @@ class _DocumentHeader extends StatelessWidget {
               onPressed: onReselectSheets,
               icon: const Icon(Icons.table_view_outlined, size: 17),
               label: Text('${task.selectedSheetNames.length} 个工作表'),
+            ),
+            const SizedBox(width: 8),
+          ],
+          if (onEditTableSource != null) ...[
+            TextButton.icon(
+              onPressed: onEditTableSource,
+              icon: const Icon(Icons.edit_note, size: 17),
+              label: const Text('编辑源数据'),
             ),
             const SizedBox(width: 8),
           ],
@@ -1939,11 +2250,13 @@ class _MarkdownPreview extends ConsumerStatefulWidget {
     required this.taskId,
     required this.revision,
     required this.markdown,
+    required this.isPastedTable,
   });
 
   final String taskId;
   final int revision;
   final String markdown;
+  final bool isPastedTable;
 
   @override
   ConsumerState<_MarkdownPreview> createState() => _MarkdownPreviewState();
@@ -1966,6 +2279,7 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
     super.didUpdateWidget(oldWidget);
     if (widget.taskId != oldWidget.taskId ||
         widget.revision != oldWidget.revision ||
+        widget.isPastedTable != oldWidget.isPastedTable ||
         widget.markdown != oldWidget.markdown) {
       _resetScrollPosition();
       _parse();
@@ -1985,6 +2299,7 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
         _LegacyMarkdownPreview(
           markdown: widget.markdown,
           controller: _scrollController,
+          isPastedTable: widget.isPastedTable,
         ),
       );
     }
@@ -1997,6 +2312,7 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
         document: document,
         controller: _scrollController,
         imageBuilder: _imageBuilder,
+        isPastedTable: widget.isPastedTable,
       ),
     );
   }
@@ -2004,9 +2320,16 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
   Widget _buildScrollablePreview(Widget child) {
     return Scrollbar(
       controller: _scrollController,
+      notificationPredicate: (notification) =>
+          notification.metrics.axis == Axis.vertical,
       child: ScrollConfiguration(
         behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-        child: child,
+        child: widget.isPastedTable && _fallback
+            ? _PastedTablePreviewScrollFrame(
+                key: ValueKey((widget.taskId, widget.revision, _fallback)),
+                child: child,
+              )
+            : child,
       ),
     );
   }
@@ -2023,6 +2346,7 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
           taskId: widget.taskId,
           revision: widget.revision,
           source: widget.markdown,
+          enableTableLineBreaks: widget.isPastedTable,
         )
         .then((document) {
           if (!mounted || request != _request) return;
@@ -2067,16 +2391,115 @@ class _MarkdownPreviewState extends ConsumerState<_MarkdownPreview> {
   }
 }
 
+/// Keep the table's horizontal control at the viewport edge, even when the
+/// bottom of a long table is far below the visible portion of the document.
+class _PastedTablePreviewScrollFrame extends StatefulWidget {
+  const _PastedTablePreviewScrollFrame({
+    super.key,
+    required this.child,
+    this.controller,
+  });
+
+  final Widget child;
+  final ScrollController? controller;
+
+  @override
+  State<_PastedTablePreviewScrollFrame> createState() =>
+      _PastedTablePreviewScrollFrameState();
+}
+
+class _PastedTablePreviewScrollFrameState
+    extends State<_PastedTablePreviewScrollFrame> {
+  // Borrow the table's existing controller; its owner retains disposal. This
+  // avoids another scroll view or rebuilding the parsed Markdown on scrolling.
+  ScrollController? _observedController;
+
+  ScrollController? get _horizontalController =>
+      widget.controller ?? _observedController;
+
+  void _observeHorizontalScroll(BuildContext? notificationContext, Axis axis) {
+    if (widget.controller != null) return;
+    if (axis != Axis.horizontal || notificationContext == null) return;
+    final controller = Scrollable.maybeOf(
+      notificationContext,
+      axis: Axis.horizontal,
+    )?.widget.controller;
+    if (controller == null || identical(controller, _horizontalController)) {
+      return;
+    }
+    setState(() => _observedController = controller);
+    // The first metrics notification arrived before the pinned scrollbar was
+    // attached to this controller. Replay it after rebuilding so its painter
+    // and drag hit area are initialized without requiring a first scroll.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !notificationContext.mounted ||
+          !identical(controller, _horizontalController) ||
+          !controller.hasClients) {
+        return;
+      }
+      ScrollMetricsNotification(
+        metrics: controller.position.copyWith(),
+        context: notificationContext,
+      ).dispatch(notificationContext);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return NotificationListener<ScrollMetricsNotification>(
+      onNotification: (notification) {
+        _observeHorizontalScroll(
+          notification.context,
+          notification.metrics.axis,
+        );
+        return false;
+      },
+      child: NotificationListener<ScrollNotification>(
+        onNotification: (notification) {
+          _observeHorizontalScroll(
+            notification.context,
+            notification.metrics.axis,
+          );
+          return false;
+        },
+        child: Scrollbar(
+          key: const ValueKey('pasted-table-preview-horizontal-scrollbar'),
+          controller: _horizontalController,
+          thumbVisibility: _horizontalController != null,
+          interactive: _horizontalController != null,
+          thickness: 10,
+          scrollbarOrientation: ScrollbarOrientation.bottom,
+          notificationPredicate: (notification) =>
+              notification.metrics.axis == Axis.horizontal,
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 14),
+            child: ScrollbarTheme(
+              data: ScrollbarTheme.of(context).copyWith(
+                thickness: const WidgetStatePropertyAll(0),
+                interactive: false,
+              ),
+              child: widget.child,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ParsedMarkdownView extends StatefulWidget {
   const _ParsedMarkdownView({
     required this.document,
     required this.controller,
     required this.imageBuilder,
+    required this.isPastedTable,
   });
 
   final ParsedMarkdownDocument document;
   final ScrollController controller;
   final MarkdownImageBuilder imageBuilder;
+  final bool isPastedTable;
 
   @override
   State<_ParsedMarkdownView> createState() => _ParsedMarkdownViewState();
@@ -2087,16 +2510,24 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
   static const _padding = EdgeInsets.fromLTRB(28, 22, 28, 48);
   static const _eagerSourceLimit = 256 * 1024;
   static const _eagerNodeLimit = 1000;
+  // Even-sized groups preserve the table's alternating row decorations.
+  static const _tableRowsPerBlock = 2;
+  static const _tableColumnWidth = 180.0;
 
+  final _horizontalController = ScrollController();
   final List<GestureRecognizer> _recognizers = [];
   List<Widget> _children = const [];
   List<GlobalKey> _measurementKeys = const [];
   List<double>? _itemExtents;
+  List<md.Node> _nodes = const [];
+  final Set<int> _tableContinuations = {};
+  double _tableWidth = 0;
   late MarkdownStyleSheet _styleSheet;
   bool _ready = false;
   int _layoutGeneration = 0;
 
   bool get _useEagerLayout =>
+      !widget.isPastedTable &&
       widget.document.sourceLength <= _eagerSourceLimit &&
       widget.document.nodes.length <= _eagerNodeLimit;
 
@@ -2118,15 +2549,16 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
 
   @override
   void dispose() {
+    _horizontalController.dispose();
     _disposeRecognizers();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final Widget scrollable;
+    final Widget verticalScrollable;
     if (_useEagerLayout) {
-      scrollable = SingleChildScrollView(
+      verticalScrollable = SingleChildScrollView(
         controller: widget.controller,
         padding: _padding,
         child: Column(
@@ -2135,7 +2567,7 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
         ),
       );
     } else if (_itemExtents == null) {
-      scrollable = SingleChildScrollView(
+      verticalScrollable = SingleChildScrollView(
         controller: widget.controller,
         padding: _padding,
         child: Column(
@@ -2147,15 +2579,16 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
         ),
       );
     } else {
-      final itemExtents = _itemExtents!;
-      scrollable = CustomScrollView(
+      verticalScrollable = CustomScrollView(
         controller: widget.controller,
-        scrollCacheExtent: const ScrollCacheExtent.viewport(0.5),
+        scrollCacheExtent: ScrollCacheExtent.viewport(
+          widget.isPastedTable ? 0 : 0.5,
+        ),
         slivers: [
           SliverPadding(
             padding: _padding,
             sliver: _MeasuredExtentSliver(
-              itemExtents: itemExtents,
+              itemExtents: _itemExtents!,
               delegate: SliverChildBuilderDelegate(
                 (context, index) => _children[index],
                 childCount: _children.length,
@@ -2166,6 +2599,25 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
         ],
       );
     }
+
+    final scrollable = widget.isPastedTable
+        ? _PastedTablePreviewScrollFrame(
+            controller: _horizontalController,
+            child: LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                controller: _horizontalController,
+                scrollDirection: Axis.horizontal,
+                child: SizedBox(
+                  width: math.max(
+                    constraints.maxWidth,
+                    _tableWidth + _padding.horizontal,
+                  ),
+                  child: verticalScrollable,
+                ),
+              ),
+            ),
+          )
+        : verticalScrollable;
 
     return Stack(
       fit: StackFit.expand,
@@ -2184,23 +2636,20 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
 
   void _buildChildren() {
     _disposeRecognizers();
-    _styleSheet = MarkdownStyleSheet.fromTheme(
+    _prepareNodes();
+    final baseStyleSheet = MarkdownStyleSheet.fromTheme(
       Theme.of(context),
     ).copyWith(textScaler: MediaQuery.textScalerOf(context));
-    final builder = MarkdownBuilder(
-      delegate: this,
-      selectable: false,
-      styleSheet: _styleSheet,
-      imageDirectory: null,
-      imageBuilder: widget.imageBuilder,
-      checkboxBuilder: null,
-      bulletBuilder: null,
-      builders: const <String, MarkdownElementBuilder>{},
-      paddingBuilders: const <String, MarkdownPaddingBuilder>{},
-      listItemCrossAxisAlignment: MarkdownListItemCrossAxisAlignment.baseline,
-      fitContent: false,
-    );
-    _children = List.unmodifiable(builder.build(widget.document.nodes));
+    _styleSheet = widget.isPastedTable
+        ? baseStyleSheet.copyWith(
+            tableColumnWidth: const _PastedTableColumnWidth(_tableColumnWidth),
+          )
+        : baseStyleSheet;
+    _children = _useEagerLayout
+        ? List.unmodifiable(_createMarkdownBuilder().build(_nodes))
+        : List.unmodifiable(
+            List<Widget>.generate(_nodes.length, _buildMarkdownBlock),
+          );
     _itemExtents = null;
     _measurementKeys = _useEagerLayout
         ? const []
@@ -2239,6 +2688,104 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
     });
   }
 
+  void _prepareNodes() {
+    _tableContinuations.clear();
+    _tableWidth = 0;
+    if (!widget.isPastedTable) {
+      _nodes = widget.document.nodes;
+      return;
+    }
+    final nodes = <md.Node>[];
+    for (final node in widget.document.nodes) {
+      if (node is! md.Element || node.tag != 'table') {
+        nodes.add(node);
+        continue;
+      }
+      final rows = <md.Element>[
+        for (final section in node.children ?? <md.Node>[])
+          if (section is md.Element)
+            if (section.tag == 'tr')
+              section
+            else
+              ...?section.children?.whereType<md.Element>().where(
+                (child) => child.tag == 'tr',
+              ),
+      ];
+      for (final row in rows) {
+        _tableWidth = math.max(
+          _tableWidth,
+          (row.children?.length ?? 0) * _tableColumnWidth,
+        );
+      }
+      for (var start = 0; start < rows.length; start += _tableRowsPerBlock) {
+        if (start > 0) _tableContinuations.add(nodes.length);
+        nodes.add(
+          md.Element('table', [
+            md.Element(
+              'tbody',
+              rows.sublist(
+                start,
+                math.min(start + _tableRowsPerBlock, rows.length),
+              ),
+            ),
+          ])..attributes.addAll(node.attributes),
+        );
+      }
+    }
+    _nodes = nodes;
+  }
+
+  Widget _buildMarkdownBlock(int index) {
+    final documentKey = widget.document.key;
+    var styleSheet = _styleSheet;
+    if (_tableContinuations.contains(index)) {
+      final border = styleSheet.tableBorder;
+      styleSheet = styleSheet.copyWith(
+        // A continuation starts with a body row, so do not repeat the header
+        // decoration or double the horizontal border between groups.
+        tableHeadCellsDecoration:
+            styleSheet.tableCellsDecoration ?? const BoxDecoration(),
+        tableBorder: border == null
+            ? null
+            : TableBorder(
+                left: border.left,
+                right: border.right,
+                bottom: border.bottom,
+                horizontalInside: border.horizontalInside,
+                verticalInside: border.verticalInside,
+              ),
+      );
+    }
+    final node = _nodes[index];
+    final block = _MarkdownPreviewBlock(
+      key: ValueKey(
+        'markdown-preview-block-${documentKey.taskId}-${documentKey.revision}-$index',
+      ),
+      node: node,
+      styleSheet: styleSheet,
+      imageBuilder: widget.imageBuilder,
+    );
+    // Sliver children receive a tight viewport width. Loosen it for tables so
+    // fixed columns retain their width when the window is wider than the table.
+    return widget.isPastedTable && node is md.Element && node.tag == 'table'
+        ? Align(alignment: AlignmentDirectional.topStart, child: block)
+        : block;
+  }
+
+  MarkdownBuilder _createMarkdownBuilder() => MarkdownBuilder(
+    delegate: this,
+    selectable: false,
+    styleSheet: _styleSheet,
+    imageDirectory: null,
+    imageBuilder: widget.imageBuilder,
+    checkboxBuilder: null,
+    bulletBuilder: null,
+    builders: const <String, MarkdownElementBuilder>{},
+    paddingBuilders: const <String, MarkdownPaddingBuilder>{},
+    listItemCrossAxisAlignment: MarkdownListItemCrossAxisAlignment.baseline,
+    fitContent: false,
+  );
+
   void _disposeRecognizers() {
     for (final recognizer in _recognizers) {
       recognizer.dispose();
@@ -2260,6 +2807,22 @@ class _ParsedMarkdownViewState extends State<_ParsedMarkdownView>
       text: code.replaceFirst(RegExp(r'\n$'), ''),
     );
   }
+}
+
+// Fixed widths without per-group horizontal scroll views from MarkdownBuilder.
+// The containing preview owns one shared horizontal viewport and scrollbar.
+class _PastedTableColumnWidth extends TableColumnWidth {
+  const _PastedTableColumnWidth(this.width);
+
+  final double width;
+
+  @override
+  double minIntrinsicWidth(Iterable<RenderBox> cells, double containerWidth) =>
+      width;
+
+  @override
+  double maxIntrinsicWidth(Iterable<RenderBox> cells, double containerWidth) =>
+      width;
 }
 
 class _MeasuredExtentSliver extends SliverMultiBoxAdaptorWidget {
@@ -2306,9 +2869,8 @@ class _RenderMeasuredExtentSliver extends RenderSliverVariedExtentList {
   }
 
   @override
-  double indexToLayoutOffset(double itemExtent, int index) {
-    return _offsets[index.clamp(0, _itemExtents.length)];
-  }
+  double indexToLayoutOffset(double itemExtent, int index) =>
+      _offsets[index.clamp(0, _itemExtents.length)];
 
   @override
   int getMinChildIndexForScrollOffset(double scrollOffset, double itemExtent) {
@@ -2341,9 +2903,7 @@ class _RenderMeasuredExtentSliver extends RenderSliverVariedExtentList {
   double computeMaxScrollOffset(
     SliverConstraints constraints,
     double itemExtent,
-  ) {
-    return _offsets.last;
-  }
+  ) => _offsets.last;
 
   static List<double> _buildOffsets(List<double> extents) {
     final offsets = List<double>.filled(extents.length + 1, 0);
@@ -2382,14 +2942,111 @@ class _RenderMeasuredExtentSliver extends RenderSliverVariedExtentList {
   }
 }
 
+class _MarkdownPreviewBlock extends StatefulWidget {
+  const _MarkdownPreviewBlock({
+    super.key,
+    required this.node,
+    required this.styleSheet,
+    required this.imageBuilder,
+  });
+
+  final md.Node node;
+  final MarkdownStyleSheet styleSheet;
+  final MarkdownImageBuilder imageBuilder;
+
+  @override
+  State<_MarkdownPreviewBlock> createState() => _MarkdownPreviewBlockState();
+}
+
+class _MarkdownPreviewBlockState extends State<_MarkdownPreviewBlock>
+    implements MarkdownBuilderDelegate {
+  final List<GestureRecognizer> _recognizers = [];
+  List<Widget> _children = const [];
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _buildChildren();
+  }
+
+  @override
+  void didUpdateWidget(_MarkdownPreviewBlock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(widget.node, oldWidget.node) ||
+        widget.styleSheet != oldWidget.styleSheet ||
+        widget.imageBuilder != oldWidget.imageBuilder) {
+      _buildChildren();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_children.isEmpty) return const SizedBox.shrink();
+    if (_children.length == 1) return _children.single;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: _children,
+    );
+  }
+
+  void _buildChildren() {
+    _disposeRecognizers();
+    final builder = MarkdownBuilder(
+      delegate: this,
+      selectable: false,
+      styleSheet: widget.styleSheet,
+      imageDirectory: null,
+      imageBuilder: widget.imageBuilder,
+      checkboxBuilder: null,
+      bulletBuilder: null,
+      builders: const <String, MarkdownElementBuilder>{},
+      paddingBuilders: const <String, MarkdownPaddingBuilder>{},
+      listItemCrossAxisAlignment: MarkdownListItemCrossAxisAlignment.baseline,
+      fitContent: false,
+    );
+    _children = List.unmodifiable(builder.build([widget.node]));
+  }
+
+  void _disposeRecognizers() {
+    for (final recognizer in _recognizers) {
+      recognizer.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  @override
+  GestureRecognizer createLink(String text, String? href, String title) {
+    final recognizer = TapGestureRecognizer()..onTap = () {};
+    _recognizers.add(recognizer);
+    return recognizer;
+  }
+
+  @override
+  TextSpan formatText(MarkdownStyleSheet styleSheet, String code) {
+    return TextSpan(
+      style: styleSheet.code,
+      text: code.replaceFirst(RegExp(r'\n$'), ''),
+    );
+  }
+}
+
 class _LegacyMarkdownPreview extends StatelessWidget {
   const _LegacyMarkdownPreview({
     required this.markdown,
     required this.controller,
+    required this.isPastedTable,
   });
 
   final String markdown;
   final ScrollController controller;
+  final bool isPastedTable;
 
   @override
   Widget build(BuildContext context) {
@@ -2397,6 +3054,13 @@ class _LegacyMarkdownPreview extends StatelessWidget {
       data: markdown,
       controller: controller,
       selectable: true,
+      styleSheet: isPastedTable
+          ? MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+              tableColumnWidth: const FixedColumnWidth(180),
+              tableScrollbarThumbVisibility: true,
+            )
+          : null,
+      extensionSet: isPastedTable ? tableMarkdownPreviewExtensionSet() : null,
       padding: const EdgeInsets.fromLTRB(28, 22, 28, 48),
       imageBuilder: (uri, title, alt) => Container(
         constraints: const BoxConstraints(minHeight: 72),
